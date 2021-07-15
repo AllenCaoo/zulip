@@ -16,7 +16,7 @@ from zerver.lib.message import (
     get_raw_unread_data,
 )
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.lib.test_helpers import get_subscription, queries_captured, tornado_redirected_to_list
+from zerver.lib.test_helpers import get_subscription, queries_captured
 from zerver.lib.topic_mutes import add_topic_mute
 from zerver.models import (
     Message,
@@ -173,7 +173,7 @@ class UnreadCountTests(ZulipTestCase):
         content = "Test message for unset read bit"
         last_msg = self.send_stream_message(self.example_user("hamlet"), "Verona", content)
         user_messages = list(UserMessage.objects.filter(message=last_msg))
-        self.assertEqual(len(user_messages) > 0, True)
+        self.assertGreater(len(user_messages), 0)
         for um in user_messages:
             self.assertEqual(um.message.content, content)
             if um.user_profile.email != self.example_email("hamlet"):
@@ -225,7 +225,7 @@ class UnreadCountTests(ZulipTestCase):
         )
 
         events: List[Mapping[str, Any]] = []
-        with tornado_redirected_to_list(events):
+        with self.tornado_redirected_to_list(events, expected_num_events=1):
             result = self.client_post(
                 "/json/mark_stream_as_read",
                 {
@@ -234,7 +234,6 @@ class UnreadCountTests(ZulipTestCase):
             )
 
         self.assert_json_success(result)
-        self.assertTrue(len(events) == 1)
 
         event = events[0]["event"]
         expected = dict(
@@ -246,7 +245,7 @@ class UnreadCountTests(ZulipTestCase):
         )
 
         differences = [key for key in expected if expected[key] != event[key]]
-        self.assertTrue(len(differences) == 0)
+        self.assert_length(differences, 0)
 
         hamlet = self.example_user("hamlet")
         um = list(UserMessage.objects.filter(message=message_id))
@@ -296,7 +295,7 @@ class UnreadCountTests(ZulipTestCase):
             self.example_user("hamlet"), "Denmark", "hello", "Denmark2"
         )
         events: List[Mapping[str, Any]] = []
-        with tornado_redirected_to_list(events):
+        with self.tornado_redirected_to_list(events, expected_num_events=1):
             result = self.client_post(
                 "/json/mark_topic_as_read",
                 {
@@ -306,7 +305,6 @@ class UnreadCountTests(ZulipTestCase):
             )
 
         self.assert_json_success(result)
-        self.assertTrue(len(events) == 1)
 
         event = events[0]["event"]
         expected = dict(
@@ -318,7 +316,7 @@ class UnreadCountTests(ZulipTestCase):
         )
 
         differences = [key for key in expected if expected[key] != event[key]]
-        self.assertTrue(len(differences) == 0)
+        self.assert_length(differences, 0)
 
         um = list(UserMessage.objects.filter(message=message_id))
         for msg in um:

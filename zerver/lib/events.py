@@ -22,6 +22,7 @@ from zerver.lib.actions import (
 from zerver.lib.alert_words import user_alert_words
 from zerver.lib.avatar import avatar_url
 from zerver.lib.bot_config import load_bot_config_template
+from zerver.lib.compatibility import is_outdated_server
 from zerver.lib.external_accounts import DEFAULT_EXTERNAL_ACCOUNTS
 from zerver.lib.hotspots import get_next_hotspots
 from zerver.lib.integrations import EMBEDDED_BOTS, WEBHOOK_INTEGRATIONS
@@ -50,7 +51,6 @@ from zerver.lib.user_mutes import get_user_mutes
 from zerver.lib.user_status import get_user_info_dict
 from zerver.lib.users import get_cross_realm_dicts, get_raw_user_data, is_administrator_role
 from zerver.models import (
-    MAX_MESSAGE_LENGTH,
     MAX_TOPIC_NAME_LENGTH,
     Client,
     CustomProfileField,
@@ -81,7 +81,7 @@ def add_realm_logo_fields(state: Dict[str, Any], realm: Realm) -> None:
     state["realm_logo_source"] = get_realm_logo_source(realm, night=False)
     state["realm_night_logo_url"] = get_realm_logo_url(realm, night=True)
     state["realm_night_logo_source"] = get_realm_logo_source(realm, night=True)
-    state["max_logo_file_size"] = settings.MAX_LOGO_FILE_SIZE
+    state["max_logo_file_size_mib"] = settings.MAX_LOGO_FILE_SIZE_MIB
 
 
 def always_want(msg_type: str) -> bool:
@@ -218,8 +218,8 @@ def fetch_initial_state_data(
         state["realm_allow_message_editing"] = (
             False if user_profile is None else realm.allow_message_editing
         )
-        state["realm_allow_community_topic_editing"] = (
-            False if user_profile is None else realm.allow_community_topic_editing
+        state["realm_edit_topic_policy"] = (
+            Realm.POLICY_ADMINS_ONLY if user_profile is None else realm.edit_topic_policy
         )
         state["realm_allow_message_deleting"] = (
             False if user_profile is None else realm.allow_message_deleting
@@ -241,12 +241,10 @@ def fetch_initial_state_data(
         state["realm_presence_disabled"] = True if user_profile is None else realm.presence_disabled
 
         # Important: Encode units in the client-facing API name.
-        state["max_avatar_file_size_mib"] = settings.MAX_AVATAR_FILE_SIZE
+        state["max_avatar_file_size_mib"] = settings.MAX_AVATAR_FILE_SIZE_MIB
         state["max_file_upload_size_mib"] = settings.MAX_FILE_UPLOAD_SIZE
-        # TODO: This should have units in its name
-        state["max_icon_file_size"] = settings.MAX_ICON_FILE_SIZE
-        # TODO: This should have units in its name
-        state["realm_upload_quota"] = realm.upload_quota_bytes()
+        state["max_icon_file_size_mib"] = settings.MAX_ICON_FILE_SIZE_MIB
+        state["realm_upload_quota_mib"] = realm.upload_quota_bytes()
 
         state["realm_icon_url"] = realm_icon_url(realm)
         state["realm_icon_source"] = realm.icon_source
@@ -278,6 +276,11 @@ def fetch_initial_state_data(
         state["server_name_changes_disabled"] = settings.NAME_CHANGES_DISABLED
         state["giphy_rating_options"] = realm.GIPHY_RATING_OPTIONS
 
+        state["server_needs_upgrade"] = is_outdated_server(user_profile)
+        state[
+            "event_queue_longpoll_timeout_seconds"
+        ] = settings.EVENT_QUEUE_LONGPOLL_TIMEOUT_SECONDS
+
         # TODO: Should these have the realm prefix replaced with server_?
         state["realm_push_notifications_enabled"] = push_notifications_enabled()
         state["realm_default_external_accounts"] = DEFAULT_EXTERNAL_ACCOUNTS
@@ -302,7 +305,7 @@ def fetch_initial_state_data(
         state["max_stream_name_length"] = Stream.MAX_NAME_LENGTH
         state["max_stream_description_length"] = Stream.MAX_DESCRIPTION_LENGTH
         state["max_topic_length"] = MAX_TOPIC_NAME_LENGTH
-        state["max_message_length"] = MAX_MESSAGE_LENGTH
+        state["max_message_length"] = settings.MAX_MESSAGE_LENGTH
 
     if want("realm_domains"):
         state["realm_domains"] = get_realm_domains(realm)
@@ -342,6 +345,7 @@ def fetch_initial_state_data(
             # restrictions apply to these users as well, and it lets
             # us avoid unnecessary conditionals.
             role=UserProfile.ROLE_GUEST,
+            is_billing_admin=False,
             avatar_source=UserProfile.AVATAR_FROM_GRAVATAR,
             # ID=0 is not used in real Zulip databases, ensuring this is unique.
             id=0,
@@ -378,6 +382,7 @@ def fetch_initial_state_data(
         state["is_owner"] = settings_user.is_realm_owner
         state["is_moderator"] = settings_user.is_moderator
         state["is_guest"] = settings_user.is_guest
+        state["is_billing_admin"] = settings_user.is_billing_admin
         state["user_id"] = settings_user.id
         state["enter_sends"] = settings_user.enter_sends
         state["email"] = settings_user.email
@@ -498,7 +503,8 @@ def fetch_initial_state_data(
     if want("update_display_settings"):
         for prop in UserProfile.property_types:
             state[prop] = getattr(settings_user, prop)
-            state["emojiset_choices"] = UserProfile.emojiset_choices()
+        state["emojiset_choices"] = UserProfile.emojiset_choices()
+        state["timezone"] = settings_user.timezone
 
     if want("update_global_notifications"):
         for notification in UserProfile.notification_setting_types:
@@ -608,6 +614,10 @@ def apply_event(
                 if stream_dict["first_message_id"] is None:
                     stream_dict["first_message_id"] = event["message"]["id"]
 
+    elif event["type"] == "heartbeat":
+        # It may be impossible for a heartbeat event to actually reach
+        # this code path. But in any case, they're noops.
+        pass
     elif event["type"] == "hotspots":
         state["hotspots"] = event["hotspots"]
     elif event["type"] == "custom_profile_fields":
@@ -674,7 +684,14 @@ def apply_event(
                             user_profile, include_all_active=user_profile.is_realm_admin
                         )
 
-                for field in ["delivery_email", "email", "full_name"]:
+                    if state["is_guest"]:
+                        state["realm_default_streams"] = []
+                    else:
+                        state["realm_default_streams"] = streams_to_dicts_sorted(
+                            get_default_streams_for_realm(user_profile.realm_id)
+                        )
+
+                for field in ["delivery_email", "email", "full_name", "is_billing_admin"]:
                     if field in person and field in state:
                         state[field] = person[field]
 
@@ -709,6 +726,8 @@ def apply_event(
                         p["is_admin"] = is_administrator_role(person["role"])
                         p["is_owner"] = person["role"] == UserProfile.ROLE_REALM_OWNER
                         p["is_guest"] = person["role"] == UserProfile.ROLE_GUEST
+                    if "is_billing_admin" in person:
+                        p["is_billing_admin"] = person["is_billing_admin"]
                     if "custom_profile_field" in person:
                         custom_field_id = person["custom_profile_field"]["id"]
                         custom_field_new_value = person["custom_profile_field"]["value"]
@@ -808,7 +827,7 @@ def apply_event(
             if event["property"] == "plan_type":
                 # Then there are some extra fields that also need to be set.
                 state["zulip_plan_is_not_limited"] = event["value"] != Realm.LIMITED
-                state["realm_upload_quota"] = event["extra_data"]["upload_quota"]
+                state["realm_upload_quota_mib"] = event["extra_data"]["upload_quota"]
 
             policy_permission_dict = {
                 "create_stream_policy": "can_create_streams",
@@ -968,23 +987,6 @@ def apply_event(
         if "raw_recent_private_conversations" not in state or event["message_type"] != "private":
             return
 
-        recipient_id = get_recent_conversations_recipient_id(
-            user_profile, event["recipient_id"], event["sender_id"]
-        )
-
-        # Ideally, we'd have test coverage for these two blocks.  To
-        # do that, we'll need a test where we delete not-the-latest
-        # messages or delete a private message not in
-        # recent_private_conversations.
-        if recipient_id not in state["raw_recent_private_conversations"]:  # nocoverage
-            return
-
-        old_max_message_id = state["raw_recent_private_conversations"][recipient_id][
-            "max_message_id"
-        ]
-        if old_max_message_id not in message_ids:  # nocoverage
-            return
-
         # OK, we just deleted what had been the max_message_id for
         # this recent conversation; we need to recompute that value
         # from scratch.  Definitely don't need to re-query everything,
@@ -1053,7 +1055,8 @@ def apply_event(
     elif event["type"] == "realm_playgrounds":
         state["realm_playgrounds"] = event["realm_playgrounds"]
     elif event["type"] == "update_display_settings":
-        assert event["setting_name"] in UserProfile.property_types
+        if event["setting_name"] != "timezone":
+            assert event["setting_name"] in UserProfile.property_types
         state[event["setting_name"]] = event["setting"]
     elif event["type"] == "update_global_notifications":
         assert event["notification_name"] in UserProfile.notification_setting_types

@@ -81,6 +81,7 @@ def add_subscriptions(client: Client) -> None:
 
     validate_against_openapi_schema(result, "/users/me/subscriptions", "post", "200_0")
 
+    ensure_users([26], ["newbie"])
     # {code_example|start}
     # To subscribe other users to a stream, you may pass
     # the `principals` argument, like so:
@@ -238,6 +239,7 @@ def get_user_by_email(client: Client) -> None:
 
 @openapi_test_function("/users/{user_id}:get")
 def get_single_user(client: Client) -> None:
+    ensure_users([8], ["cordelia"])
 
     # {code_example|start}
     # Fetch details on a user given a user ID
@@ -255,6 +257,7 @@ def get_single_user(client: Client) -> None:
 
 @openapi_test_function("/users/{user_id}:delete")
 def deactivate_user(client: Client) -> None:
+    ensure_users([8], ["cordelia"])
 
     # {code_example|start}
     # Deactivate a user
@@ -276,6 +279,7 @@ def reactivate_user(client: Client) -> None:
 
 @openapi_test_function("/users/{user_id}:patch")
 def update_user(client: Client) -> None:
+    ensure_users([8, 10], ["cordelia", "hamlet"])
 
     # {code_example|start}
     # Change a user's full name.
@@ -294,6 +298,8 @@ def update_user(client: Client) -> None:
 
 @openapi_test_function("/users/{user_id}/subscriptions/{stream_id}:get")
 def get_subscription_status(client: Client) -> None:
+    ensure_users([7], ["zoe"])
+
     # {code_example|start}
     # Check whether a user is a subscriber to a given stream.
     user_id = 7
@@ -512,7 +518,7 @@ def get_streams(client: Client) -> None:
     # {code_example|end}
 
     validate_against_openapi_schema(result, "/streams", "get", "200")
-    assert len(result["streams"]) == 4
+    assert len(result["streams"]) == 5
 
 
 @openapi_test_function("/streams/{stream_id}:patch")
@@ -725,7 +731,7 @@ def update_subscription_settings(client: Client) -> None:
             "value": True,
         },
         {
-            "stream_id": 3,
+            "stream_id": 7,
             "property": "color",
             "value": "#f00f00",
         },
@@ -1095,6 +1101,18 @@ def deregister_queue(client: Client, queue_id: str) -> None:
     # Test "BAD_EVENT_QUEUE_ID" error
     result = client.deregister(queue_id)
     validate_against_openapi_schema(result, "/events", "delete", "400")
+
+
+@openapi_test_function("/events:get")
+def get_queue(client: Client, queue_id: str) -> None:
+
+    # {code_example|start}
+    # If you already have a queue registered and thus, have a queue_id
+    # on hand, you may use client.get_events() and pass in the above
+    # parameters, like so:
+    result = client.get_events(queue_id=queue_id, last_event_id=-1)
+    # {code_example|end}
+    validate_against_openapi_schema(result, "/events", "get", "200")
 
 
 @openapi_test_function("/server_settings:get")
@@ -1511,6 +1529,7 @@ def test_queues(client: Client) -> None:
     # thoroughly tested in zerver/tests/test_event_queue.py, it is not worth
     # the effort to come up with asynchronous logic for testing those here.
     queue_id = register_queue(client)
+    get_queue(client, queue_id)
     deregister_queue(client, queue_id)
     register_queue_all_events(client)
 

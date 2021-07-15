@@ -6,10 +6,12 @@ from unittest import mock
 import orjson
 from django.db import IntegrityError
 from django.http import HttpResponse
+from django.utils.timezone import now as timezone_now
 
 from zerver.lib.actions import (
     do_change_stream_post_policy,
     do_change_user_role,
+    do_delete_messages,
     do_set_realm_property,
     do_update_message,
     get_topic_messages,
@@ -18,11 +20,11 @@ from zerver.lib.actions import (
 from zerver.lib.message import MessageDict, has_message_access, messages_for_ids
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import cache_tries_captured, queries_captured
-from zerver.lib.topic import LEGACY_PREV_TOPIC, TOPIC_NAME
+from zerver.lib.topic import LEGACY_PREV_TOPIC, RESOLVED_TOPIC_PREFIX, TOPIC_NAME
 from zerver.models import Message, Realm, Stream, UserMessage, UserProfile, get_realm, get_stream
 
 
-class EditMessageTest(ZulipTestCase):
+class EditMessageTestCase(ZulipTestCase):
     def check_topic(self, msg_id: int, topic_name: str) -> None:
         msg = Message.objects.get(id=msg_id)
         self.assertEqual(msg.topic_name(), topic_name)
@@ -74,6 +76,155 @@ class EditMessageTest(ZulipTestCase):
                 orjson.loads(msg.edit_history),
             )
 
+    def prepare_move_topics(
+        self, user_email: str, old_stream: str, new_stream: str, topic: str
+    ) -> Tuple[UserProfile, Stream, Stream, int, int]:
+        user_profile = self.example_user(user_email)
+        self.login(user_email)
+        stream = self.make_stream(old_stream)
+        new_stream = self.make_stream(new_stream)
+        self.subscribe(user_profile, stream.name)
+        self.subscribe(user_profile, new_stream.name)
+        msg_id = self.send_stream_message(
+            user_profile, stream.name, topic_name=topic, content="First"
+        )
+        msg_id_lt = self.send_stream_message(
+            user_profile, stream.name, topic_name=topic, content="Second"
+        )
+
+        self.send_stream_message(user_profile, stream.name, topic_name=topic, content="third")
+
+        return (user_profile, stream, new_stream, msg_id, msg_id_lt)
+
+
+class EditMessagePayloadTest(EditMessageTestCase):
+    def test_edit_message_no_changes(self) -> None:
+        self.login("hamlet")
+        msg_id = self.send_stream_message(
+            self.example_user("hamlet"), "Scotland", topic_name="editing", content="before edit"
+        )
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {
+                "message_id": msg_id,
+            },
+        )
+        self.assert_json_error(result, "Nothing to change")
+
+    def test_move_message_cant_move_private_message(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login("hamlet")
+        cordelia = self.example_user("cordelia")
+        msg_id = self.send_personal_message(hamlet, cordelia)
+
+        verona = get_stream("Verona", hamlet.realm)
+
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {
+                "message_id": msg_id,
+                "stream_id": verona.id,
+            },
+        )
+
+        self.assert_json_error(result, "Private messages cannot be moved to streams.")
+
+    def test_private_message_edit_topic(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login("hamlet")
+        cordelia = self.example_user("cordelia")
+        msg_id = self.send_personal_message(hamlet, cordelia)
+
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {
+                "message_id": msg_id,
+                "topic": "Should not exist",
+            },
+        )
+
+        self.assert_json_error(result, "Private messages cannot have topics.")
+
+    def test_propagate_invalid(self) -> None:
+        self.login("hamlet")
+        id1 = self.send_stream_message(self.example_user("hamlet"), "Scotland", topic_name="topic1")
+
+        result = self.client_patch(
+            "/json/messages/" + str(id1),
+            {
+                "topic": "edited",
+                "propagate_mode": "invalid",
+            },
+        )
+        self.assert_json_error(result, "Invalid propagate_mode")
+        self.check_topic(id1, topic_name="topic1")
+
+        result = self.client_patch(
+            "/json/messages/" + str(id1),
+            {
+                "content": "edited",
+                "propagate_mode": "change_all",
+            },
+        )
+        self.assert_json_error(result, "Invalid propagate_mode without topic edit")
+        self.check_topic(id1, topic_name="topic1")
+
+    def test_edit_message_no_topic(self) -> None:
+        self.login("hamlet")
+        msg_id = self.send_stream_message(
+            self.example_user("hamlet"), "Scotland", topic_name="editing", content="before edit"
+        )
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {
+                "message_id": msg_id,
+                "topic": " ",
+            },
+        )
+        self.assert_json_error(result, "Topic can't be empty")
+
+    def test_move_message_to_stream_with_content(self) -> None:
+        (user_profile, old_stream, new_stream, msg_id, msg_id_later) = self.prepare_move_topics(
+            "iago", "test move stream", "new stream", "test"
+        )
+
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {
+                "message_id": msg_id,
+                "stream_id": new_stream.id,
+                "propagate_mode": "change_all",
+                "content": "Not allowed",
+            },
+        )
+        self.assert_json_error(result, "Cannot change message content while changing stream")
+
+        messages = get_topic_messages(user_profile, old_stream, "test")
+        self.assert_length(messages, 3)
+
+        messages = get_topic_messages(user_profile, new_stream, "test")
+        self.assert_length(messages, 0)
+
+    # Right now, we prevent users from editing widgets.
+    def test_edit_submessage(self) -> None:
+        self.login("hamlet")
+        msg_id = self.send_stream_message(
+            self.example_user("hamlet"),
+            "Scotland",
+            topic_name="editing",
+            content="/poll Games?\nYES\nNO",
+        )
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {
+                "message_id": msg_id,
+                "content": "/poll Games?\nYES\nNO\nMaybe",
+            },
+        )
+        self.assert_json_error(result, "Widgets cannot be edited.")
+
+
+class EditMessageTest(EditMessageTestCase):
     def test_query_count_on_to_dict_uncached(self) -> None:
         # `to_dict_uncached` method is used by the mechanisms
         # tested in this class. Hence, its performance is tested here.
@@ -189,24 +340,6 @@ class EditMessageTest(ZulipTestCase):
         result = self.client_get("/json/messages/" + str(msg_id))
         self.assert_json_error(result, "Invalid message(s)")
 
-    # Right now, we prevent users from editing widgets.
-    def test_edit_submessage(self) -> None:
-        self.login("hamlet")
-        msg_id = self.send_stream_message(
-            self.example_user("hamlet"),
-            "Scotland",
-            topic_name="editing",
-            content="/poll Games?\nYES\nNO",
-        )
-        result = self.client_patch(
-            "/json/messages/" + str(msg_id),
-            {
-                "message_id": msg_id,
-                "content": "/poll Games?\nYES\nNO\nMaybe",
-            },
-        )
-        self.assert_json_error(result, "Widgets cannot be edited.")
-
     def test_edit_message_no_permission(self) -> None:
         self.login("hamlet")
         msg_id = self.send_stream_message(
@@ -220,33 +353,6 @@ class EditMessageTest(ZulipTestCase):
             },
         )
         self.assert_json_error(result, "You don't have permission to edit this message")
-
-    def test_edit_message_no_changes(self) -> None:
-        self.login("hamlet")
-        msg_id = self.send_stream_message(
-            self.example_user("hamlet"), "Scotland", topic_name="editing", content="before edit"
-        )
-        result = self.client_patch(
-            "/json/messages/" + str(msg_id),
-            {
-                "message_id": msg_id,
-            },
-        )
-        self.assert_json_error(result, "Nothing to change")
-
-    def test_edit_message_no_topic(self) -> None:
-        self.login("hamlet")
-        msg_id = self.send_stream_message(
-            self.example_user("hamlet"), "Scotland", topic_name="editing", content="before edit"
-        )
-        result = self.client_patch(
-            "/json/messages/" + str(msg_id),
-            {
-                "message_id": msg_id,
-                "topic": " ",
-            },
-        )
-        self.assert_json_error(result, "Topic can't be empty")
 
     def test_edit_message_no_content(self) -> None:
         self.login("hamlet")
@@ -617,16 +723,14 @@ class EditMessageTest(ZulipTestCase):
         def set_message_editing_params(
             allow_message_editing: bool,
             message_content_edit_limit_seconds: int,
-            allow_community_topic_editing: bool,
+            edit_topic_policy: int,
         ) -> None:
             result = self.client_patch(
                 "/json/realm",
                 {
                     "allow_message_editing": orjson.dumps(allow_message_editing).decode(),
                     "message_content_edit_limit_seconds": message_content_edit_limit_seconds,
-                    "allow_community_topic_editing": orjson.dumps(
-                        allow_community_topic_editing
-                    ).decode(),
+                    "edit_topic_policy": edit_topic_policy,
                 },
             )
             self.assert_json_success(result)
@@ -676,58 +780,61 @@ class EditMessageTest(ZulipTestCase):
 
         # test the various possible message editing settings
         # high enough time limit, all edits allowed
-        set_message_editing_params(True, 240, False)
+        set_message_editing_params(True, 240, Realm.POLICY_ADMINS_ONLY)
         do_edit_message_assert_success(id_, "A")
 
         # out of time, only topic editing allowed
-        set_message_editing_params(True, 120, False)
+        set_message_editing_params(True, 120, Realm.POLICY_ADMINS_ONLY)
         do_edit_message_assert_success(id_, "B", True)
         do_edit_message_assert_error(id_, "C", "The time limit for editing this message has passed")
 
         # infinite time, all edits allowed
-        set_message_editing_params(True, 0, False)
+        set_message_editing_params(True, 0, Realm.POLICY_ADMINS_ONLY)
         do_edit_message_assert_success(id_, "D")
 
         # without allow_message_editing, nothing is allowed
-        set_message_editing_params(False, 240, False)
+        set_message_editing_params(False, 240, Realm.POLICY_ADMINS_ONLY)
         do_edit_message_assert_error(
             id_, "E", "Your organization has turned off message editing", True
         )
-        set_message_editing_params(False, 120, False)
+        set_message_editing_params(False, 120, Realm.POLICY_ADMINS_ONLY)
         do_edit_message_assert_error(
             id_, "F", "Your organization has turned off message editing", True
         )
-        set_message_editing_params(False, 0, False)
+        set_message_editing_params(False, 0, Realm.POLICY_ADMINS_ONLY)
         do_edit_message_assert_error(
             id_, "G", "Your organization has turned off message editing", True
         )
 
-    def test_allow_community_topic_editing(self) -> None:
+    def test_edit_topic_policy(self) -> None:
         def set_message_editing_params(
             allow_message_editing: bool,
             message_content_edit_limit_seconds: int,
-            allow_community_topic_editing: bool,
+            edit_topic_policy: int,
         ) -> None:
+            self.login("iago")
             result = self.client_patch(
                 "/json/realm",
                 {
                     "allow_message_editing": orjson.dumps(allow_message_editing).decode(),
                     "message_content_edit_limit_seconds": message_content_edit_limit_seconds,
-                    "allow_community_topic_editing": orjson.dumps(
-                        allow_community_topic_editing
-                    ).decode(),
+                    "edit_topic_policy": edit_topic_policy,
                 },
             )
             self.assert_json_success(result)
 
-        def do_edit_message_assert_success(id_: int, unique_str: str) -> None:
+        def do_edit_message_assert_success(id_: int, unique_str: str, acting_user: str) -> None:
+            self.login(acting_user)
             new_topic = "topic" + unique_str
             params_dict = {"message_id": id_, "topic": new_topic}
             result = self.client_patch("/json/messages/" + str(id_), params_dict)
             self.assert_json_success(result)
             self.check_topic(id_, topic_name=new_topic)
 
-        def do_edit_message_assert_error(id_: int, unique_str: str, error: str) -> None:
+        def do_edit_message_assert_error(
+            id_: int, unique_str: str, error: str, acting_user: str
+        ) -> None:
+            self.login(acting_user)
             message = Message.objects.get(id=id_)
             old_topic = message.topic_name()
             old_content = message.content
@@ -740,7 +847,6 @@ class EditMessageTest(ZulipTestCase):
             self.assertEqual(msg.topic_name(), old_topic)
             self.assertEqual(msg.content, old_content)
 
-        self.login("iago")
         # send a message in the past
         id_ = self.send_stream_message(
             self.example_user("hamlet"), "Scotland", content="content", topic_name="topic"
@@ -749,39 +855,71 @@ class EditMessageTest(ZulipTestCase):
         message.date_sent = message.date_sent - datetime.timedelta(seconds=180)
         message.save()
 
+        # Guest user must be subscribed to the stream to access the message.
+        polonius = self.example_user("polonius")
+        self.subscribe(polonius, "Scotland")
+
         # any user can edit the topic of a message
-        set_message_editing_params(True, 0, True)
-        # log in as a new user
-        self.login("cordelia")
-        do_edit_message_assert_success(id_, "A")
+        set_message_editing_params(True, 0, Realm.POLICY_EVERYONE)
+        do_edit_message_assert_success(id_, "A", "polonius")
+
+        # only members can edit topic of a message
+        set_message_editing_params(True, 0, Realm.POLICY_MEMBERS_ONLY)
+        do_edit_message_assert_error(
+            id_, "B", "You don't have permission to edit this message", "polonius"
+        )
+        do_edit_message_assert_success(id_, "B", "cordelia")
+
+        # only full members can edit topic of a message
+        set_message_editing_params(True, 0, Realm.POLICY_FULL_MEMBERS_ONLY)
+
+        cordelia = self.example_user("cordelia")
+        do_set_realm_property(cordelia.realm, "waiting_period_threshold", 10, acting_user=None)
+
+        cordelia.date_joined = timezone_now() - datetime.timedelta(days=9)
+        cordelia.save()
+        do_edit_message_assert_error(
+            id_, "C", "You don't have permission to edit this message", "cordelia"
+        )
+
+        cordelia.date_joined = timezone_now() - datetime.timedelta(days=11)
+        cordelia.save()
+        do_edit_message_assert_success(id_, "C", "cordelia")
+
+        # only moderators can edit topic of a message
+        set_message_editing_params(True, 0, Realm.POLICY_MODERATORS_ONLY)
+        do_edit_message_assert_error(
+            id_, "D", "You don't have permission to edit this message", "cordelia"
+        )
+        do_edit_message_assert_success(id_, "D", "shiva")
 
         # only admins can edit the topics of messages
-        self.login("iago")
-        set_message_editing_params(True, 0, False)
-        do_edit_message_assert_success(id_, "B")
-        self.login("cordelia")
-        do_edit_message_assert_error(id_, "C", "You don't have permission to edit this message")
+        set_message_editing_params(True, 0, Realm.POLICY_ADMINS_ONLY)
+        do_edit_message_assert_error(
+            id_, "E", "You don't have permission to edit this message", "shiva"
+        )
+        do_edit_message_assert_success(id_, "E", "iago")
 
         # users cannot edit topics if allow_message_editing is False
-        self.login("iago")
-        set_message_editing_params(False, 0, True)
-        self.login("cordelia")
-        do_edit_message_assert_error(id_, "D", "Your organization has turned off message editing")
+        set_message_editing_params(False, 0, Realm.POLICY_EVERYONE)
+        do_edit_message_assert_error(
+            id_, "D", "Your organization has turned off message editing", "cordelia"
+        )
 
         # non-admin users cannot edit topics sent > 72 hrs ago
         message.date_sent = message.date_sent - datetime.timedelta(seconds=290000)
         message.save()
-        self.login("iago")
-        set_message_editing_params(True, 0, True)
-        do_edit_message_assert_success(id_, "E")
-        self.login("cordelia")
-        do_edit_message_assert_error(id_, "F", "The time limit for editing this message has passed")
+        set_message_editing_params(True, 0, Realm.POLICY_EVERYONE)
+        do_edit_message_assert_success(id_, "E", "iago")
+        do_edit_message_assert_success(id_, "F", "shiva")
+        do_edit_message_assert_error(
+            id_, "G", "The time limit for editing this message's topic has passed", "cordelia"
+        )
 
         # anyone should be able to edit "no topic" indefinitely
         message.set_topic_name("(no topic)")
         message.save()
-        self.login("cordelia")
-        do_edit_message_assert_success(id_, "D")
+        do_edit_message_assert_success(id_, "D", "cordelia")
 
     @mock.patch("zerver.lib.actions.send_event")
     def test_edit_topic_public_history_stream(self, mock_send_event: mock.MagicMock) -> None:
@@ -812,9 +950,8 @@ class EditMessageTest(ZulipTestCase):
                 send_notification_to_old_thread=False,
                 send_notification_to_new_thread=False,
                 content=None,
-                rendered_content=None,
+                rendering_result=None,
                 prior_mention_user_ids=set(),
-                mention_user_ids=set(),
                 mention_data=None,
             )
 
@@ -1072,50 +1209,6 @@ class EditMessageTest(ZulipTestCase):
         self.check_topic(id3, topic_name="topiC1")
         self.check_topic(id4, topic_name="edited")
 
-    def test_propagate_invalid(self) -> None:
-        self.login("hamlet")
-        id1 = self.send_stream_message(self.example_user("hamlet"), "Scotland", topic_name="topic1")
-
-        result = self.client_patch(
-            "/json/messages/" + str(id1),
-            {
-                "topic": "edited",
-                "propagate_mode": "invalid",
-            },
-        )
-        self.assert_json_error(result, "Invalid propagate_mode")
-        self.check_topic(id1, topic_name="topic1")
-
-        result = self.client_patch(
-            "/json/messages/" + str(id1),
-            {
-                "content": "edited",
-                "propagate_mode": "change_all",
-            },
-        )
-        self.assert_json_error(result, "Invalid propagate_mode without topic edit")
-        self.check_topic(id1, topic_name="topic1")
-
-    def prepare_move_topics(
-        self, user_email: str, old_stream: str, new_stream: str, topic: str
-    ) -> Tuple[UserProfile, Stream, Stream, int, int]:
-        user_profile = self.example_user(user_email)
-        self.login(user_email)
-        stream = self.make_stream(old_stream)
-        new_stream = self.make_stream(new_stream)
-        self.subscribe(user_profile, stream.name)
-        self.subscribe(user_profile, new_stream.name)
-        msg_id = self.send_stream_message(
-            user_profile, stream.name, topic_name=topic, content="First"
-        )
-        msg_id_lt = self.send_stream_message(
-            user_profile, stream.name, topic_name=topic, content="Second"
-        )
-
-        self.send_stream_message(user_profile, stream.name, topic_name=topic, content="third")
-
-        return (user_profile, stream, new_stream, msg_id, msg_id_lt)
-
     def test_move_message_to_stream(self) -> None:
         (user_profile, old_stream, new_stream, msg_id, msg_id_lt) = self.prepare_move_topics(
             "iago", "test move stream", "new stream", "test"
@@ -1267,29 +1360,6 @@ class EditMessageTest(ZulipTestCase):
             Message.objects.get(id=new_inaccessible_msg_id).recipient_id,
             private_stream.recipient_id,
         )
-
-    def test_move_message_cant_move_private_message(
-        self,
-    ) -> None:
-        user_profile = self.example_user("iago")
-        self.assertEqual(user_profile.role, UserProfile.ROLE_REALM_ADMINISTRATOR)
-        self.login("iago")
-
-        hamlet = self.example_user("hamlet")
-        msg_id = self.send_personal_message(user_profile, hamlet)
-
-        verona = get_stream("Verona", user_profile.realm)
-
-        result = self.client_patch(
-            "/json/messages/" + str(msg_id),
-            {
-                "message_id": msg_id,
-                "stream_id": verona.id,
-                "propagate_mode": "change_all",
-            },
-        )
-
-        self.assert_json_error(result, "Message must be a stream message")
 
     def test_move_message_to_stream_change_later(self) -> None:
         (user_profile, old_stream, new_stream, msg_id, msg_id_later) = self.prepare_move_topics(
@@ -1491,9 +1561,21 @@ class EditMessageTest(ZulipTestCase):
         )
         check_move_message_to_stream(UserProfile.ROLE_MEMBER)
 
-    def test_move_message_to_stream_with_content(self) -> None:
+    def test_move_message_to_stream_with_topic_editing_not_allowed(self) -> None:
         (user_profile, old_stream, new_stream, msg_id, msg_id_later) = self.prepare_move_topics(
-            "iago", "test move stream", "new stream", "test"
+            "othello", "old_stream_1", "new_stream_1", "test"
+        )
+
+        realm = user_profile.realm
+        realm.edit_topic_policy = Realm.POLICY_ADMINS_ONLY
+        realm.save()
+        self.login("cordelia")
+
+        do_set_realm_property(
+            user_profile.realm,
+            "move_messages_between_streams_policy",
+            Realm.POLICY_MEMBERS_ONLY,
+            acting_user=None,
         )
 
         result = self.client_patch(
@@ -1502,16 +1584,24 @@ class EditMessageTest(ZulipTestCase):
                 "message_id": msg_id,
                 "stream_id": new_stream.id,
                 "propagate_mode": "change_all",
-                "content": "Not allowed",
+                "topic": "new topic",
             },
         )
-        self.assert_json_error(result, "Cannot change message content while changing stream")
+        self.assert_json_error(result, "You don't have permission to edit this message")
 
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {
+                "message_id": msg_id,
+                "stream_id": new_stream.id,
+                "propagate_mode": "change_all",
+            },
+        )
+        self.assert_json_success(result)
         messages = get_topic_messages(user_profile, old_stream, "test")
-        self.assert_length(messages, 3)
-
+        self.assert_length(messages, 1)
         messages = get_topic_messages(user_profile, new_stream, "test")
-        self.assert_length(messages, 0)
+        self.assert_length(messages, 4)
 
     def test_move_message_to_stream_and_topic(self) -> None:
         (user_profile, old_stream, new_stream, msg_id, msg_id_later) = self.prepare_move_topics(
@@ -1865,6 +1955,105 @@ class EditMessageTest(ZulipTestCase):
 
         self.check_has_permission_policies("move_messages_between_streams_policy", validation_func)
 
+    def test_mark_topic_as_resolved(self) -> None:
+        self.login("iago")
+        admin_user = self.example_user("iago")
+        stream = self.make_stream("new")
+        self.subscribe(admin_user, stream.name)
+        original_topic = "topic 1"
+        id1 = self.send_stream_message(
+            self.example_user("hamlet"), "new", topic_name=original_topic
+        )
+        id2 = self.send_stream_message(admin_user, "new", topic_name=original_topic)
+
+        # Check that we don't incorrectly send "unresolve topic"
+        # notifications when asking the preserve the current topic.
+        result = self.client_patch(
+            "/json/messages/" + str(id1),
+            {
+                "message_id": id1,
+                "topic": original_topic,
+                "propagate_mode": "change_all",
+            },
+        )
+        self.assert_json_error(result, "Nothing to change")
+
+        resolved_topic = RESOLVED_TOPIC_PREFIX + original_topic
+        result = self.client_patch(
+            "/json/messages/" + str(id1),
+            {
+                "message_id": id1,
+                "topic": resolved_topic,
+                "propagate_mode": "change_all",
+            },
+        )
+
+        self.assert_json_success(result)
+        for msg_id in [id1, id2]:
+            msg = Message.objects.get(id=msg_id)
+            self.assertEqual(
+                resolved_topic,
+                msg.topic_name(),
+            )
+
+        messages = get_topic_messages(admin_user, stream, resolved_topic)
+        self.assert_length(messages, 3)
+        self.assertEqual(
+            messages[2].content,
+            f"@_**Iago|{admin_user.id}** has marked this topic as resolved.",
+        )
+
+        # Now move to a weird state and confirm no new messages
+        weird_topic = "✔ ✔✔" + original_topic
+        result = self.client_patch(
+            "/json/messages/" + str(id1),
+            {
+                "message_id": id1,
+                "topic": weird_topic,
+                "propagate_mode": "change_all",
+            },
+        )
+
+        self.assert_json_success(result)
+        for msg_id in [id1, id2]:
+            msg = Message.objects.get(id=msg_id)
+            self.assertEqual(
+                weird_topic,
+                msg.topic_name(),
+            )
+
+        messages = get_topic_messages(admin_user, stream, weird_topic)
+        self.assert_length(messages, 3)
+        self.assertEqual(
+            messages[2].content,
+            f"@_**Iago|{admin_user.id}** has marked this topic as resolved.",
+        )
+
+        unresolved_topic = original_topic
+        result = self.client_patch(
+            "/json/messages/" + str(id1),
+            {
+                "message_id": id1,
+                "topic": unresolved_topic,
+                "propagate_mode": "change_all",
+            },
+        )
+
+        self.assert_json_success(result)
+        for msg_id in [id1, id2]:
+            msg = Message.objects.get(id=msg_id)
+            self.assertEqual(
+                unresolved_topic,
+                msg.topic_name(),
+            )
+
+        messages = get_topic_messages(admin_user, stream, unresolved_topic)
+        self.assert_length(messages, 4)
+        self.assertEqual(
+            messages[3].content,
+            f"@_**Iago|{admin_user.id}** has marked this topic as unresolved.",
+        )
+
 
 class DeleteMessageTest(ZulipTestCase):
     def test_delete_message_invalid_request_format(self) -> None:
@@ -1976,3 +2165,20 @@ class DeleteMessageTest(ZulipTestCase):
             m.side_effect = Message.DoesNotExist()
             result = test_delete_message_by_owner(msg_id=msg_id)
             self.assert_json_error(result, "Message already deleted")
+
+    def test_delete_event_sent_after_transaction_commits(self) -> None:
+        """
+        Tests that `send_event` is hooked to `transaction.on_commit`. This is important, because
+        we don't want to end up holding locks on message rows for too long if the event queue runs
+        into a problem.
+        """
+        hamlet = self.example_user("hamlet")
+        self.send_stream_message(hamlet, "Scotland")
+        message = self.get_last_message()
+
+        with self.tornado_redirected_to_list([], expected_num_events=1):
+            with mock.patch("zerver.lib.actions.send_event") as m:
+                m.side_effect = AssertionError(
+                    "Events should be sent only after the transaction commits."
+                )
+                do_delete_messages(hamlet.realm, [message])

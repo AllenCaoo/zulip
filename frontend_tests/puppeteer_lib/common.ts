@@ -71,7 +71,6 @@ class CommonUtils {
                 ],
                 // TODO: Change defaultViewport to 1280x1024 when puppeteer fixes the window size issue with firefox.
                 // Here is link to the issue that is tracking the above problem https://github.com/puppeteer/puppeteer/issues/6442.
-                // @ts-expect-error: Because of https://github.com/puppeteer/puppeteer/issues/6885
                 defaultViewport: null,
                 headless: true,
             });
@@ -262,7 +261,7 @@ class CommonUtils {
         // Wait for a email input in login page so we know login
         // page is loaded. Then check that we are at the login url.
         await page.waitForSelector('input[name="username"]');
-        assert(page.url().includes("/login/"));
+        assert.ok(page.url().includes("/login/"));
     }
 
     async ensure_enter_does_not_send(page: Page): Promise<void> {
@@ -467,7 +466,7 @@ class CommonUtils {
         await page.waitForSelector("#settings_overlay_container.show", {visible: true});
 
         const url = await this.page_url_with_fragment(page);
-        assert(/^http:\/\/[^/]+\/#organization/.test(url), "Unexpected manage organization URL");
+        assert.match(url, /^http:\/\/[^/]+\/#organization/, "Unexpected manage organization URL");
 
         const organization_settings_data_section = "li[data-section='organization-settings']";
         await page.click(organization_settings_data_section);
@@ -485,6 +484,13 @@ class CommonUtils {
             `//*[@class="typeahead dropdown-menu" and contains(@style, "display: block")]//li[contains(normalize-space(), "${item}")]//a`,
         );
         await entry!.click();
+    }
+
+    async wait_for_modal_to_close(page: Page): Promise<void> {
+        // This function will ensure that the mouse events are enabled for the background for further tests.
+        await page.waitForFunction(
+            () => document.querySelector(".overlay.show")?.getAttribute("style") === null,
+        );
     }
 
     async run_test(test_function: (page: Page) => Promise<void>): Promise<void> {

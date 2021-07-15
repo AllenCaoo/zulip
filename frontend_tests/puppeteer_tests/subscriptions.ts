@@ -45,7 +45,7 @@ async function open_streams_modal(page: Page): Promise<void> {
 
     await page.waitForSelector("#subscription_overlay.new-style", {visible: true});
     const url = await common.page_url_with_fragment(page);
-    assert(url.includes("#streams/all"));
+    assert.ok(url.includes("#streams/all"));
 }
 
 async function test_subscription_button_verona_stream(page: Page): Promise<void> {
@@ -174,11 +174,11 @@ async function create_stream(page: Page): Promise<void> {
     await page.waitForFunction(() => $(".stream-name").is(':contains("Puppeteer")'));
     const stream_name = await common.get_text_from_selector(
         page,
-        ".stream-header .stream-name .stream-name-editable",
+        ".stream-header .stream-name .sub-stream-name",
     );
     const stream_description = await common.get_text_from_selector(
         page,
-        ".stream-description-editable ",
+        ".stream-description .sub-stream-description",
     );
     const subscriber_count_selector = "[data-stream-name='Puppeteer'] .subscriber-count";
     assert.strictEqual(stream_name, "Puppeteer");
@@ -239,21 +239,22 @@ async function test_streams_search_feature(page: Page): Promise<void> {
         ),
         "Verona",
     );
-    assert(
+    assert.ok(
         !(await common.get_text_from_selector(page, hidden_streams_selector)).includes("Verona"),
         "#Verona is hidden",
     );
 
     await page.type('#stream_filter input[type="text"]', "Puppeteer");
+    await page.waitForSelector(".stream-row[data-stream-name='core team']", {hidden: true});
     assert.strictEqual(
         await common.get_text_from_selector(page, ".stream-row:not(.notdisplayed) .stream-name"),
         "Puppeteer",
     );
-    assert(
+    assert.ok(
         (await common.get_text_from_selector(page, hidden_streams_selector)).includes("Verona"),
         "#Verona is not hidden",
     );
-    assert(
+    assert.ok(
         !(await common.get_text_from_selector(page, hidden_streams_selector)).includes("Puppeteer"),
         "Puppeteer is hidden after searching.",
     );

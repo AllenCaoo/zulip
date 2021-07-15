@@ -380,6 +380,24 @@ def send_email_to_admins(
     )
 
 
+def send_email_to_billing_admins_and_realm_owners(
+    template_prefix: str,
+    realm: Realm,
+    from_name: Optional[str] = None,
+    from_address: Optional[str] = None,
+    language: Optional[str] = None,
+    context: Dict[str, Any] = {},
+) -> None:
+    send_email(
+        template_prefix,
+        to_user_ids=[user.id for user in realm.get_human_billing_admin_and_realm_owner_users()],
+        from_name=from_name,
+        from_address=from_address,
+        language=language,
+        context=context,
+    )
+
+
 def clear_scheduled_invitation_emails(email: str) -> None:
     """Unlike most scheduled emails, invitation emails don't have an
     existing user object to key off of, so we filter by address here."""
@@ -434,7 +452,7 @@ def deliver_scheduled_emails(email: ScheduledEmail) -> None:
         # This state doesn't make sense, so something must be mutating,
         # or in the process of deleting, the object. We assume it will bring
         # things to a correct state, and we just do nothing except logging this event.
-        logger.warning("ScheduledEmail id %s has empty users and address attributes.", email.id)
+        logger.error("ScheduledEmail id %s has empty users and address attributes.", email.id)
         return
 
     if user_ids:
@@ -482,7 +500,7 @@ def send_custom_email(users: List[UserProfile], options: Dict[str, Any]) -> None
     with open(plain_text_template_path, "w") as f:
         f.write(parsed_email_template.get_payload())
 
-    from zerver.templatetags.app_filters import render_markdown_path
+    from zerver.lib.templates import render_markdown_path
 
     rendered_input = render_markdown_path(plain_text_template_path.replace("templates/", ""))
 

@@ -211,10 +211,15 @@ class TestGetMissedMessageToken(ZulipTestCase):
 class TestFilterFooter(ZulipTestCase):
     def test_filter_footer(self) -> None:
         text = """Test message
+        --Not a delimiter--
+        More message
         --
         Footer"""
+        expected_output = """Test message
+        --Not a delimiter--
+        More message"""
         result = filter_footer(text)
-        self.assertEqual(result, "Test message")
+        self.assertEqual(result, expected_output)
 
     def test_filter_footer_many_parts(self) -> None:
         text = """Test message
@@ -1495,7 +1500,7 @@ class TestEmailMirrorLogAndReport(ZulipTestCase):
         self.assertEqual(
             error_log.output,
             [
-                "ERROR:zerver.lib.email_mirror:Sender: hamlet@zulip.com\nTo: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX@testserver <Address to stream id: 1>\ntest error message"
+                f"ERROR:zerver.lib.email_mirror:Sender: hamlet@zulip.com\nTo: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX@testserver <Address to stream id: {stream.id}>\ntest error message"
             ],
         )
         message = most_recent_message(user_profile)

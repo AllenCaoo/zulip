@@ -519,6 +519,7 @@ realm_user_dict_fields: List[str] = [
     "avatar_version",
     "is_active",
     "role",
+    "is_billing_admin",
     "is_bot",
     "realm_id",
     "timezone",
@@ -534,8 +535,8 @@ def realm_user_dicts_cache_key(realm_id: int) -> str:
     return f"realm_user_dicts:{realm_id}"
 
 
-def get_muting_users_cache_key(muted_user: "UserProfile") -> str:
-    return f"muting_users_list:{muted_user.id}"
+def get_muting_users_cache_key(muted_user_id: int) -> str:
+    return f"muting_users_list:{muted_user_id}"
 
 
 def get_realm_used_upload_space_cache_key(realm: "Realm") -> str:
@@ -648,7 +649,7 @@ def flush_user_profile(sender: Any, **kwargs: Any) -> None:
 
 def flush_muting_users_cache(sender: Any, **kwargs: Any) -> None:
     mute_object = kwargs["instance"]
-    cache_delete(get_muting_users_cache_key(mute_object.muted_user))
+    cache_delete(get_muting_users_cache_key(mute_object.muted_user_id))
 
 
 # Called by models.py to flush various caches whenever we save
@@ -700,8 +701,12 @@ def flush_stream(sender: Any, **kwargs: Any) -> None:
 
     stream = kwargs["instance"]
     items_for_remote_cache = {}
-    items_for_remote_cache[get_stream_cache_key(stream.name, stream.realm_id)] = (stream,)
-    cache_set_many(items_for_remote_cache)
+
+    if kwargs.get("update_fields") is None:
+        cache_delete(get_stream_cache_key(stream.name, stream.realm_id))
+    else:
+        items_for_remote_cache[get_stream_cache_key(stream.name, stream.realm_id)] = (stream,)
+        cache_set_many(items_for_remote_cache)
 
     if (
         kwargs.get("update_fields") is None

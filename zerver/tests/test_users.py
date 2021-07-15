@@ -19,6 +19,7 @@ from zerver.lib.actions import (
     do_deactivate_user,
     do_delete_user,
     do_invite_users,
+    do_mute_user,
     do_reactivate_user,
     do_set_realm_property,
     get_emails_from_user_ids,
@@ -42,7 +43,6 @@ from zerver.lib.test_helpers import (
     queries_captured,
     reset_emails_in_zulip_realm,
     simulated_empty_cache,
-    tornado_redirected_to_list,
 )
 from zerver.lib.topic_mutes import add_topic_mute
 from zerver.lib.upload import upload_avatar_image
@@ -185,7 +185,7 @@ class PermissionTest(ZulipTestCase):
 
         req = dict(role=UserProfile.ROLE_REALM_OWNER)
         events: List[Mapping[str, Any]] = []
-        with tornado_redirected_to_list(events):
+        with self.tornado_redirected_to_list(events, expected_num_events=1):
             result = self.client_patch(f"/json/users/{othello.id}", req)
         self.assert_json_success(result)
         owner_users = realm.get_human_owner_users()
@@ -195,8 +195,7 @@ class PermissionTest(ZulipTestCase):
         self.assertEqual(person["role"], UserProfile.ROLE_REALM_OWNER)
 
         req = dict(role=UserProfile.ROLE_MEMBER)
-        events = []
-        with tornado_redirected_to_list(events):
+        with self.tornado_redirected_to_list(events, expected_num_events=1):
             result = self.client_patch(f"/json/users/{othello.id}", req)
         self.assert_json_success(result)
         owner_users = realm.get_human_owner_users()
@@ -208,8 +207,7 @@ class PermissionTest(ZulipTestCase):
         # Cannot take away from last owner
         self.login("desdemona")
         req = dict(role=UserProfile.ROLE_MEMBER)
-        events = []
-        with tornado_redirected_to_list(events):
+        with self.tornado_redirected_to_list(events, expected_num_events=1):
             result = self.client_patch(f"/json/users/{iago.id}", req)
         self.assert_json_success(result)
         owner_users = realm.get_human_owner_users()
@@ -217,7 +215,7 @@ class PermissionTest(ZulipTestCase):
         person = events[0]["event"]["person"]
         self.assertEqual(person["user_id"], iago.id)
         self.assertEqual(person["role"], UserProfile.ROLE_MEMBER)
-        with tornado_redirected_to_list([]):
+        with self.tornado_redirected_to_list([], expected_num_events=0):
             result = self.client_patch(f"/json/users/{desdemona.id}", req)
         self.assert_json_error(
             result, "The owner permission cannot be removed from the only organization owner."
@@ -225,7 +223,7 @@ class PermissionTest(ZulipTestCase):
 
         do_change_user_role(iago, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
         self.login("iago")
-        with tornado_redirected_to_list([]):
+        with self.tornado_redirected_to_list([], expected_num_events=0):
             result = self.client_patch(f"/json/users/{desdemona.id}", req)
         self.assert_json_error(result, "Must be an organization owner")
 
@@ -250,7 +248,7 @@ class PermissionTest(ZulipTestCase):
         req = dict(role=orjson.dumps(UserProfile.ROLE_REALM_ADMINISTRATOR).decode())
 
         events: List[Mapping[str, Any]] = []
-        with tornado_redirected_to_list(events):
+        with self.tornado_redirected_to_list(events, expected_num_events=1):
             result = self.client_patch(f"/json/users/{othello.id}", req)
         self.assert_json_success(result)
         admin_users = realm.get_human_admin_users()
@@ -261,8 +259,7 @@ class PermissionTest(ZulipTestCase):
 
         # Taketh away
         req = dict(role=orjson.dumps(UserProfile.ROLE_MEMBER).decode())
-        events = []
-        with tornado_redirected_to_list(events):
+        with self.tornado_redirected_to_list(events, expected_num_events=1):
             result = self.client_patch(f"/json/users/{othello.id}", req)
         self.assert_json_success(result)
         admin_users = realm.get_human_admin_users()
@@ -498,7 +495,7 @@ class PermissionTest(ZulipTestCase):
 
         req = dict(role=orjson.dumps(new_role).decode())
         events: List[Mapping[str, Any]] = []
-        with tornado_redirected_to_list(events):
+        with self.tornado_redirected_to_list(events, expected_num_events=1):
             result = self.client_patch(f"/json/users/{user_profile.id}", req)
         self.assert_json_success(result)
 
@@ -764,7 +761,7 @@ class QueryCountTest(ZulipTestCase):
 
         with queries_captured() as queries:
             with cache_tries_captured() as cache_tries:
-                with tornado_redirected_to_list(events):
+                with self.tornado_redirected_to_list(events, expected_num_events=8):
                     fred = do_create_user(
                         email="fred@zulip.com",
                         password="password",
@@ -774,9 +771,8 @@ class QueryCountTest(ZulipTestCase):
                         acting_user=None,
                     )
 
-        self.assert_length(queries, 70)
-        self.assert_length(cache_tries, 22)
-        self.assert_length(events, 7)
+        self.assert_length(queries, 83)
+        self.assert_length(cache_tries, 26)
 
         peer_add_events = [event for event in events if event["event"].get("op") == "peer_add"]
 
@@ -1165,15 +1161,13 @@ class UserProfileTest(ZulipTestCase):
         for hotspot in hotspots_completed:
             UserHotspot.objects.create(user=cordelia, hotspot=hotspot)
 
-        events: List[Mapping[str, Any]] = []
-        with tornado_redirected_to_list(events):
-            copy_user_settings(cordelia, iago)
-
         # Check that we didn't send an realm_user update events to
         # users; this work is happening before the user account is
         # created, so any changes will be reflected in the "add" event
         # introducing the user to clients.
-        self.assert_length(events, 0)
+        events: List[Mapping[str, Any]] = []
+        with self.tornado_redirected_to_list(events, expected_num_events=0):
+            copy_user_settings(cordelia, iago)
 
         # We verify that cordelia and iago match, but hamlet has the defaults.
         self.assertEqual(iago.full_name, "Cordelia, Lear's daughter")
@@ -1472,7 +1466,7 @@ class ActivateTest(ZulipTestCase):
         self.assertEqual(
             info_log.output,
             [
-                f"WARNING:zulip.send_email:ScheduledEmail id {email.id} has empty users and address attributes."
+                f"ERROR:zulip.send_email:ScheduledEmail id {email.id} has empty users and address attributes."
             ],
         )
 
@@ -1521,10 +1515,11 @@ class RecipientInfoTest(ZulipTestCase):
 
         expected_info = dict(
             active_user_ids=all_user_ids,
-            push_notify_user_ids=set(),
+            online_push_user_ids=set(),
             stream_push_user_ids=set(),
             stream_email_user_ids=set(),
             wildcard_mention_user_ids=set(),
+            muted_sender_user_ids=set(),
             um_eligible_user_ids=all_user_ids,
             long_term_idle_user_ids=set(),
             default_bot_user_ids=set(),
@@ -1580,7 +1575,7 @@ class RecipientInfoTest(ZulipTestCase):
         )
         self.assertEqual(info["stream_push_user_ids"], {hamlet.id})
 
-        # Now mute Hamlet to omit him from stream_push_user_ids.
+        # Now have Hamlet mute the topic to omit him from stream_push_user_ids.
         add_topic_mute(
             user_profile=hamlet,
             stream_id=stream.id,
@@ -1609,6 +1604,18 @@ class RecipientInfoTest(ZulipTestCase):
         # Since Hamlet has muted the stream and Cordelia has disabled
         # wildcard notifications, it should just be Othello here.
         self.assertEqual(info["wildcard_mention_user_ids"], {othello.id})
+
+        # If Hamlet mutes Cordelia, he should be in `muted_sender_user_ids` for a message
+        # sent by Cordelia.
+        do_mute_user(hamlet, cordelia)
+        info = get_recipient_info(
+            realm_id=realm.id,
+            recipient=recipient,
+            sender_id=cordelia.id,
+            stream_topic=stream_topic,
+            possible_wildcard_mention=True,
+        )
+        self.assertTrue(hamlet.id in info["muted_sender_user_ids"])
 
         sub = get_subscription(stream_name, othello)
         sub.wildcard_mentions_notify = False
@@ -1861,6 +1868,88 @@ class GetProfileTest(ZulipTestCase):
             avatar_url(hamlet),
         )
 
+    def test_user_email_according_to_email_address_visibility_setting(self) -> None:
+        hamlet = self.example_user("hamlet")
+
+        realm = hamlet.realm
+        do_set_realm_property(
+            realm,
+            "email_address_visibility",
+            Realm.EMAIL_ADDRESS_VISIBILITY_NOBODY,
+            acting_user=None,
+        )
+
+        # Check that even admin cannot access email when setting is set to
+        # EMAIL_ADDRESS_VISIBILITY_NOBODY.
+        self.login("iago")
+        result = orjson.loads(self.client_get(f"/json/users/{hamlet.id}").content)
+        self.assertEqual(result["user"].get("delivery_email"), None)
+        self.assertEqual(result["user"].get("email"), f"user{hamlet.id}@zulip.testserver")
+
+        do_set_realm_property(
+            realm,
+            "email_address_visibility",
+            Realm.EMAIL_ADDRESS_VISIBILITY_ADMINS,
+            acting_user=None,
+        )
+
+        # Check that admin can access email when setting is set to
+        # EMAIL_ADDRESS_VISIBILITY_ADMINS.
+        result = orjson.loads(self.client_get(f"/json/users/{hamlet.id}").content)
+        self.assertEqual(result["user"].get("delivery_email"), hamlet.delivery_email)
+        self.assertEqual(result["user"].get("email"), f"user{hamlet.id}@zulip.testserver")
+
+        # Check that moderator cannot access email when setting is set to
+        # EMAIL_ADDRESS_VISIBILITY_ADMINS.
+        self.login("shiva")
+        result = orjson.loads(self.client_get(f"/json/users/{hamlet.id}").content)
+        self.assertEqual(result["user"].get("delivery_email"), None)
+        self.assertEqual(result["user"].get("email"), f"user{hamlet.id}@zulip.testserver")
+
+        do_set_realm_property(
+            realm,
+            "email_address_visibility",
+            Realm.EMAIL_ADDRESS_VISIBILITY_MODERATORS,
+            acting_user=None,
+        )
+
+        # Check that moderator can access email when setting is set to
+        # EMAIL_ADDRESS_VISIBILITY_MODERATORS.
+        result = orjson.loads(self.client_get(f"/json/users/{hamlet.id}").content)
+        self.assertEqual(result["user"].get("delivery_email"), hamlet.delivery_email)
+        self.assertEqual(result["user"].get("email"), f"user{hamlet.id}@zulip.testserver")
+
+        # Check that normal user cannot access email when setting is set to
+        # EMAIL_ADDRESS_VISIBILITY_MODERATORS.
+        self.login("cordelia")
+        result = orjson.loads(self.client_get(f"/json/users/{hamlet.id}").content)
+        self.assertEqual(result["user"].get("delivery_email"), None)
+        self.assertEqual(result["user"].get("email"), f"user{hamlet.id}@zulip.testserver")
+
+        do_set_realm_property(
+            realm,
+            "email_address_visibility",
+            Realm.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
+            acting_user=None,
+        )
+
+        # Check that moderator, member and guest all can access email when setting
+        # is set to EMAIL_ADDRESS_VISIBILITY_EVERYONE.
+        self.login("shiva")
+        result = orjson.loads(self.client_get(f"/json/users/{hamlet.id}").content)
+        self.assertEqual(result["user"].get("delivery_email"), None)
+        self.assertEqual(result["user"].get("email"), hamlet.delivery_email)
+
+        self.login("cordelia")
+        result = orjson.loads(self.client_get(f"/json/users/{hamlet.id}").content)
+        self.assertEqual(result["user"].get("delivery_email"), None)
+        self.assertEqual(result["user"].get("email"), hamlet.delivery_email)
+
+        self.login("polonius")
+        result = orjson.loads(self.client_get(f"/json/users/{hamlet.id}").content)
+        self.assertEqual(result["user"].get("delivery_email"), None)
+        self.assertEqual(result["user"].get("email"), hamlet.delivery_email)
+
 
 class DeleteUserTest(ZulipTestCase):
     def test_do_delete_user(self) -> None:
@@ -1877,7 +1966,7 @@ class DeleteUserTest(ZulipTestCase):
         personal_message_ids_to_hamlet = Message.objects.filter(
             recipient=hamlet_personal_recipient
         ).values_list("id", flat=True)
-        self.assertTrue(len(personal_message_ids_to_hamlet) > 0)
+        self.assertGreater(len(personal_message_ids_to_hamlet), 0)
         self.assertTrue(Message.objects.filter(sender=hamlet).exists())
 
         huddle_message_ids_from_cordelia = [
@@ -1892,7 +1981,7 @@ class DeleteUserTest(ZulipTestCase):
                 user_profile=hamlet, recipient__type=Recipient.HUDDLE
             ).values_list("recipient_id", flat=True)
         )
-        self.assertTrue(len(huddle_with_hamlet_recipient_ids) > 0)
+        self.assertGreater(len(huddle_with_hamlet_recipient_ids), 0)
 
         do_delete_user(hamlet)
 

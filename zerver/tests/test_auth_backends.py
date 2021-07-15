@@ -7,7 +7,7 @@ import secrets
 import time
 import urllib
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Type
 from unittest import mock
 
 import jwt
@@ -103,6 +103,7 @@ from zproject.backends import (
     EmailAuthBackend,
     ExternalAuthDataDict,
     ExternalAuthResult,
+    GenericOpenIdConnectBackend,
     GitHubAuthBackend,
     GitLabAuthBackend,
     GoogleAuthBackend,
@@ -799,6 +800,21 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase):
     # in subclass otherwise its tests will not run.
     __unittest_skip__ = True
 
+    BACKEND_CLASS: "Type[SocialAuthMixin]"
+    LOGIN_URL: str
+    SIGNUP_URL: str
+    AUTHORIZATION_URL: str
+    AUTH_FINISH_URL: str
+    CONFIG_ERROR_URL: str
+    ACCESS_TOKEN_URL: str
+    USER_INFO_URL: str
+    CLIENT_KEY_SETTING: str
+    CLIENT_SECRET_SETTING: str
+
+    # Functions that subclasses must implement.
+    def get_account_data_dict(self, email: str, name: str) -> Dict[str, Any]:
+        ...
+
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("hamlet")
@@ -882,7 +898,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase):
         result = self.client_get(self.AUTH_FINISH_URL, dict(state=csrf_state), **headers)
         return result
 
-    def generate_access_url_payload(self, account_data_dict: Dict[str, str]) -> str:
+    def generate_access_token_url_payload(self, account_data_dict: Dict[str, str]) -> str:
         return json.dumps(
             {
                 "access_token": "foobar",
@@ -970,7 +986,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase):
                 self.ACCESS_TOKEN_URL,
                 match_querystring=False,
                 status=200,
-                body=self.generate_access_url_payload(account_data_dict),
+                body=self.generate_access_token_url_payload(account_data_dict),
             )
             requests_mock.add(
                 requests_mock.GET,
@@ -1829,9 +1845,13 @@ class SAMLAuthBackendTest(SocialAuthBase):
         with {email}, {first_name}, {last_name} placeholders, that can
         be filled out with the data we want.
         """
-        name_parts = name.split(" ")
-        first_name = name_parts[0]
-        last_name = name_parts[1]
+        if name:
+            name_parts = name.split(" ")
+            first_name = name_parts[0]
+            last_name = name_parts[1]
+        else:
+            first_name = ""
+            last_name = ""
 
         extra_attrs = ""
         for extra_attr_name, extra_attr_values in extra_attributes.items():
@@ -1860,6 +1880,29 @@ class SAMLAuthBackendTest(SocialAuthBase):
 
     def get_account_data_dict(self, email: str, name: str) -> Dict[str, Any]:
         return dict(email=email, name=name)
+
+    def test_auth_registration_with_no_name_provided(self) -> None:
+        """
+        The SAMLResponse may not actually provide name values, which is considered
+        unexpected behavior for most social backends, but SAML is an exception. The
+        signup flow should proceed normally, without pre-filling the name in the
+        registration form.
+        """
+        email = "newuser@zulip.com"
+        subdomain = "zulip"
+        realm = get_realm("zulip")
+        account_data_dict = self.get_account_data_dict(email=email, name="")
+        result = self.social_auth_test(account_data_dict, subdomain=subdomain, is_signup=True)
+        self.stage_two_of_registration(
+            result,
+            realm,
+            subdomain,
+            email,
+            "",
+            "Full Name",
+            skip_registration_form=False,
+            expect_full_name_prepopulated=False,
+        )
 
     def test_social_auth_no_key(self) -> None:
         """
@@ -1900,6 +1943,39 @@ class SAMLAuthBackendTest(SocialAuthBase):
             self.assert_in_success_response(
                 [f'entityID="{settings.SOCIAL_AUTH_SAML_SP_ENTITY_ID}"'],
                 result,
+            )
+
+    @override_settings(TERMS_OF_SERVICE=None)
+    def test_social_auth_registration_auto_signup(self) -> None:
+        """
+        Verify that with SAML auto signup enabled, a user coming from the /login page
+        (so without the is_signup param) will be taken straight to registration, without
+        having to go through the step of having to confirm that they do want to sign up.
+        """
+        email = "newuser@zulip.com"
+        name = "Full Name"
+        subdomain = "zulip"
+        realm = get_realm("zulip")
+        account_data_dict = self.get_account_data_dict(email=email, name=name)
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_dict["test_idp"]["auto_signup"] = True
+
+        with self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict):
+            result = self.social_auth_test(
+                account_data_dict,
+                expect_choose_email_screen=True,
+                subdomain=subdomain,
+                is_signup=False,
+            )
+            self.stage_two_of_registration(
+                result,
+                realm,
+                subdomain,
+                email,
+                name,
+                name,
+                self.BACKEND_CLASS.full_name_validated,
+                expect_confirm_registration_page=False,
             )
 
     def test_social_auth_complete(self) -> None:
@@ -2453,6 +2529,101 @@ class SAMLAuthBackendTest(SocialAuthBase):
             ],
         )
 
+    def test_social_auth_custom_profile_field_sync(self) -> None:
+        birthday_field = CustomProfileField.objects.get(
+            realm=self.user_profile.realm, name="Birthday"
+        )
+        old_birthday_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=birthday_field
+        ).value
+
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_dict["test_idp"]["extra_attrs"] = ["mobilePhone"]
+
+        sync_custom_attrs_dict = {
+            "zulip": {
+                "saml": {
+                    "phone_number": "mobilePhone",
+                }
+            }
+        }
+
+        with self.settings(
+            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+            SOCIAL_AUTH_SYNC_CUSTOM_ATTRS_DICT=sync_custom_attrs_dict,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes=dict(mobilePhone=["123412341234"], birthday=["2021-01-01"]),
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(data["full_name"], self.name)
+        self.assertEqual(data["subdomain"], "zulip")
+        self.assertEqual(result.status_code, 302)
+
+        phone_field = CustomProfileField.objects.get(
+            realm=self.user_profile.realm, name="Phone number"
+        )
+        phone_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=phone_field
+        ).value
+        self.assertEqual(phone_field_value, "123412341234")
+
+        # Verify the Birthday field doesn't get synced - because it isn't configured for syncing.
+        new_birthday_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=birthday_field
+        ).value
+        self.assertEqual(new_birthday_field_value, old_birthday_field_value)
+
+    def test_social_auth_custom_profile_field_sync_custom_field_not_existing(self) -> None:
+        sync_custom_attrs_dict = {
+            "zulip": {
+                "saml": {
+                    "title": "title",
+                    "phone_number": "mobilePhone",
+                }
+            }
+        }
+        self.assertFalse(
+            CustomProfileField.objects.filter(
+                realm=self.user_profile.realm, name__iexact="title"
+            ).exists()
+        )
+
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_dict["test_idp"]["extra_attrs"] = ["mobilePhone", "title"]
+
+        with self.settings(
+            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+            SOCIAL_AUTH_SYNC_CUSTOM_ATTRS_DICT=sync_custom_attrs_dict,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            with self.assertLogs(self.logger_string, level="WARNING") as m:
+                result = self.social_auth_test(
+                    account_data_dict,
+                    subdomain="zulip",
+                    extra_attributes=dict(mobilePhone=["123412341234"], birthday=["2021-01-01"]),
+                )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(data["full_name"], self.name)
+        self.assertEqual(data["subdomain"], "zulip")
+        self.assertEqual(result.status_code, 302)
+
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output(
+                    "Exception while syncing custom profile fields for "
+                    + f"user {self.user_profile.id}: Custom profile field with name title not found.",
+                    "warning",
+                )
+            ],
+        )
+
 
 class AppleAuthMixin:
     BACKEND_CLASS = AppleAuthBackend
@@ -2477,9 +2648,7 @@ class AppleAuthMixin:
         headers = {"kid": "SOMEKID"}
         private_key = settings.APPLE_ID_TOKEN_GENERATION_KEY
 
-        id_token = jwt.encode(payload, private_key, algorithm="RS256", headers=headers).decode(
-            "utf-8"
-        )
+        id_token = jwt.encode(payload, private_key, algorithm="RS256", headers=headers)
 
         return id_token
 
@@ -2533,12 +2702,13 @@ class AppleIdAuthBackendTest(AppleAuthMixin, SocialAuthBase):
             requests_mock.GET,
             self.BACKEND_CLASS.JWK_URL,
             status=200,
-            json=json.loads(settings.APPLE_JWK),
+            json=json.loads(settings.EXAMPLE_JWK),
         )
 
-    def generate_access_url_payload(self, account_data_dict: Dict[str, str]) -> str:
-        # The ACCESS_TOKEN_URL endpoint works a bit different in standard Oauth2,
-        # where the token_data_dict contains some essential data. we add that data here.
+    def generate_access_token_url_payload(self, account_data_dict: Dict[str, str]) -> str:
+        # The ACCESS_TOKEN_URL endpoint works a bit different than in standard Oauth2,
+        # and here, similarly to OIDC, id_token is also returned in the response.
+        # In Apple auth, all the user information is carried in the id_token.
         return json.dumps(
             {
                 "access_token": "foobar",
@@ -2732,7 +2902,7 @@ class AppleAuthBackendNativeFlowTest(AppleAuthMixin, SocialAuthBase):
                 requests_mock.GET,
                 self.BACKEND_CLASS.JWK_URL,
                 status=200,
-                json=json.loads(settings.APPLE_JWK),
+                json=json.loads(settings.EXAMPLE_JWK),
             )
             yield
 
@@ -2826,6 +2996,159 @@ class AppleAuthBackendNativeFlowTest(AppleAuthMixin, SocialAuthBase):
         /login/social/apple/ endpoint which isn't even a part of the native flow.
         """
         pass
+
+
+class GenericOpenIdConnectTest(SocialAuthBase):
+    __unittest_skip__ = False
+
+    BACKEND_CLASS = GenericOpenIdConnectBackend
+    CLIENT_KEY_SETTING = "SOCIAL_AUTH_TESTOIDC_KEY"
+    CLIENT_SECRET_SETTING = "SOCIAL_AUTH_TESTOIDC_SECRET"
+    LOGIN_URL = "/accounts/login/social/oidc"
+    SIGNUP_URL = "/accounts/register/social/oidc"
+
+    BASE_OIDC_URL = "https://example.com/api/openid"
+    AUTHORIZATION_URL = f"{BASE_OIDC_URL}/authorize"
+    ACCESS_TOKEN_URL = f"{BASE_OIDC_URL}/token"
+    JWKS_URL = f"{BASE_OIDC_URL}/jwks"
+    USER_INFO_URL = f"{BASE_OIDC_URL}/userinfo"
+    AUTH_FINISH_URL = "/complete/oidc/"
+    CONFIG_ERROR_URL = "/config-error/oidc"
+
+    def social_auth_test(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> HttpResponse:
+        # Example payload of the discovery endpoint (with appropriate values filled
+        # in to match our test setup).
+        # All the attributes below are REQUIRED per OIDC specification:
+        # https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata
+        # or at least required for the `code` flow with userinfo - that this implementation uses.
+        # Other flows are not supported right now.
+        idp_discovery_endpoint_payload_dict = {
+            "issuer": self.BASE_OIDC_URL,
+            "authorization_endpoint": self.AUTHORIZATION_URL,
+            "token_endpoint": self.ACCESS_TOKEN_URL,
+            "userinfo_endpoint": self.USER_INFO_URL,
+            "response_types_supported": [
+                "code",
+                "id_token",
+                "id_token token",
+                "code token",
+                "code id_token",
+                "code id_token token",
+            ],
+            "jwks_uri": self.JWKS_URL,
+            "id_token_signing_alg_values_supported": ["HS256", "RS256"],
+            "subject_types_supported": ["public"],
+        }
+
+        # We need to run the social_auth_test procedure with a mock response set up for the
+        # OIDC discovery endpoint as that's the first thing requested by the server when a user
+        # starts trying to authenticate.
+        with responses.RequestsMock(assert_all_requests_are_fired=False) as requests_mock:
+            requests_mock.add(
+                requests_mock.GET,
+                f"{self.BASE_OIDC_URL}/.well-known/openid-configuration",
+                match_querystring=False,
+                status=200,
+                body=json.dumps(idp_discovery_endpoint_payload_dict),
+            )
+            result = super().social_auth_test(*args, **kwargs)
+
+        return result
+
+    def social_auth_test_finish(self, *args: Any, **kwargs: Any) -> HttpResponse:
+        # Trying to generate a (access_token, id_token) pair here in tests that would
+        # successfully pass validation by validate_and_return_id_token is impractical
+        # and unnecessary (see python-social-auth implementation of the method for
+        # how the validation works).
+        # We can simply mock the method to make it succeed and return an empty dict, because
+        # the return value is not used for anything.
+        with mock.patch.object(
+            GenericOpenIdConnectBackend, "validate_and_return_id_token", return_value={}
+        ):
+            return super().social_auth_test_finish(*args, **kwargs)
+
+    def register_extra_endpoints(
+        self,
+        requests_mock: responses.RequestsMock,
+        account_data_dict: Dict[str, str],
+        **extra_data: Any,
+    ) -> None:
+        requests_mock.add(
+            requests_mock.GET,
+            self.JWKS_URL,
+            status=200,
+            json=json.loads(settings.EXAMPLE_JWK),
+        )
+
+    def generate_access_token_url_payload(self, account_data_dict: Dict[str, str]) -> str:
+        return json.dumps(
+            {
+                "access_token": "foobar",
+                "expires_in": time.time() + 60 * 5,
+                "id_token": "abcd1234",
+                "token_type": "bearer",
+            }
+        )
+
+    def get_account_data_dict(self, email: str, name: str) -> Dict[str, Any]:
+        return dict(
+            email=email,
+            name=name,
+            nickname="somenickname",
+            given_name=name.split(" ")[0],
+            family_name=name.split(" ")[1],
+        )
+
+    def test_social_auth_no_key(self) -> None:
+        """
+        Requires overriding because client key/secret are configured
+        in a different way than default for social auth backends.
+        """
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+
+        mock_oidc_setting_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
+        idp_config_dict = list(mock_oidc_setting_dict.values())[0]
+        del idp_config_dict["client_id"]
+        with self.settings(SOCIAL_AUTH_OIDC_ENABLED_IDPS=mock_oidc_setting_dict):
+            result = self.social_auth_test(
+                account_data_dict, subdomain="zulip", next="/user_uploads/image"
+            )
+            self.assert_in_success_response(["Configuration error", "OpenID Connect"], result)
+
+    def test_too_many_idps(self) -> None:
+        """
+        Only one IdP is supported for now.
+        """
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+
+        mock_oidc_setting_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
+        idp_config_dict = list(mock_oidc_setting_dict.values())[0]
+        mock_oidc_setting_dict["secondprovider"] = idp_config_dict
+        with self.settings(SOCIAL_AUTH_OIDC_ENABLED_IDPS=mock_oidc_setting_dict):
+            result = self.social_auth_test(
+                account_data_dict, subdomain="zulip", next="/user_uploads/image"
+            )
+            self.assert_in_success_response(["Configuration error", "OpenID Connect"], result)
+
+    def test_config_error_development(self) -> None:
+        """
+        This test is redundant for now, as test_social_auth_no_key already
+        tests this basic case, since this backend doesn't yet have more
+        comprehensive config_error pages.
+        """
+        return
+
+    def test_config_error_production(self) -> None:
+        """
+        This test is redundant for now, as test_social_auth_no_key already
+        tests this basic case, since this backend doesn't yet have more
+        comprehensive config_error pages.
+        """
+        return
 
 
 class GitHubAuthBackendTest(SocialAuthBase):
@@ -3767,7 +4090,7 @@ class FetchAPIKeyTest(ZulipTestCase):
         result = self.client_post(
             "/api/v1/fetch_api_key", dict(username=self.email, password="wrong")
         )
-        self.assert_json_error(result, "Your username or password is incorrect.", 403)
+        self.assert_json_error(result, "Your username or password is incorrect", 401)
 
     def test_invalid_subdomain(self) -> None:
         with mock.patch("zerver.views.auth.get_realm_from_request", return_value=None):
@@ -3775,7 +4098,7 @@ class FetchAPIKeyTest(ZulipTestCase):
                 "/api/v1/fetch_api_key",
                 dict(username="hamlet", password=initial_password(self.email)),
             )
-        self.assert_json_error(result, "Invalid subdomain", 400)
+        self.assert_json_error(result, "Invalid subdomain", 404)
 
     def test_password_auth_disabled(self) -> None:
         with mock.patch("zproject.backends.password_auth_enabled", return_value=False):
@@ -3783,7 +4106,9 @@ class FetchAPIKeyTest(ZulipTestCase):
                 "/api/v1/fetch_api_key",
                 dict(username=self.email, password=initial_password(self.email)),
             )
-            self.assert_json_error_contains(result, "Password auth is disabled", 403)
+            self.assert_json_error_contains(
+                result, "Password authentication is disabled in this organization", 401
+            )
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_ldap_auth_email_auth_disabled_success(self) -> None:
@@ -3797,6 +4122,7 @@ class FetchAPIKeyTest(ZulipTestCase):
 
     @override_settings(
         AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",),
+        LDAP_APPEND_DOMAIN="zulip.com",
         AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "org_membership": "department"},
     )
     def test_ldap_auth_email_auth_organization_restriction(self) -> None:
@@ -3806,26 +4132,27 @@ class FetchAPIKeyTest(ZulipTestCase):
         # The second user has one set, but to a different value
         result = self.client_post(
             "/api/v1/fetch_api_key",
-            dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+            dict(username="hamlet", password=self.ldap_password("hamlet")),
         )
-        self.assert_json_error(result, "Your username or password is incorrect.", 403)
+        self.assert_json_error(result, "Your username or password is incorrect", 401)
 
         self.change_ldap_user_attr("hamlet", "department", "testWrongRealm")
         result = self.client_post(
             "/api/v1/fetch_api_key",
-            dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+            dict(username="hamlet", password=self.ldap_password("hamlet")),
         )
-        self.assert_json_error(result, "Your username or password is incorrect.", 403)
+        self.assert_json_error(result, "Your username or password is incorrect", 401)
 
         self.change_ldap_user_attr("hamlet", "department", "zulip")
         result = self.client_post(
             "/api/v1/fetch_api_key",
-            dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+            dict(username="hamlet", password=self.ldap_password("hamlet")),
         )
         self.assert_json_success(result)
 
     @override_settings(
         AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",),
+        LDAP_APPEND_DOMAIN="zulip.com",
         AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "org_membership": "department"},
         AUTH_LDAP_ADVANCED_REALM_ACCESS_CONTROL={
             "zulip": [{"test1": "test", "test2": "testing"}, {"test1": "test2"}],
@@ -3838,24 +4165,24 @@ class FetchAPIKeyTest(ZulipTestCase):
         # The first user has no attribute set
         result = self.client_post(
             "/api/v1/fetch_api_key",
-            dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+            dict(username="hamlet", password=self.ldap_password("hamlet")),
         )
-        self.assert_json_error(result, "Your username or password is incorrect.", 403)
+        self.assert_json_error(result, "Your username or password is incorrect", 401)
 
         self.change_ldap_user_attr("hamlet", "test2", "testing")
         # Check with only one set
         result = self.client_post(
             "/api/v1/fetch_api_key",
-            dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+            dict(username="hamlet", password=self.ldap_password("hamlet")),
         )
-        self.assert_json_error(result, "Your username or password is incorrect.", 403)
+        self.assert_json_error(result, "Your username or password is incorrect", 401)
 
         self.change_ldap_user_attr("hamlet", "test1", "test")
         # Setting org_membership to not cause django_ldap_auth to warn, when synchronising
         self.change_ldap_user_attr("hamlet", "department", "wrongDepartment")
         result = self.client_post(
             "/api/v1/fetch_api_key",
-            dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+            dict(username="hamlet", password=self.ldap_password("hamlet")),
         )
         self.assert_json_success(result)
         self.remove_ldap_user_attr("hamlet", "test2")
@@ -3865,7 +4192,7 @@ class FetchAPIKeyTest(ZulipTestCase):
         self.change_ldap_user_attr("hamlet", "test1", "test2")
         result = self.client_post(
             "/api/v1/fetch_api_key",
-            dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+            dict(username="hamlet", password=self.ldap_password("hamlet")),
         )
         self.assert_json_success(result)
 
@@ -3873,7 +4200,7 @@ class FetchAPIKeyTest(ZulipTestCase):
         with override_settings(AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn"}):
             result = self.client_post(
                 "/api/v1/fetch_api_key",
-                dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+                dict(username="hamlet", password=self.ldap_password("hamlet")),
             )
             self.assert_json_success(result)
 
@@ -3881,15 +4208,15 @@ class FetchAPIKeyTest(ZulipTestCase):
         self.change_ldap_user_attr("hamlet", "test1", "invalid")
         result = self.client_post(
             "/api/v1/fetch_api_key",
-            dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+            dict(username="hamlet", password=self.ldap_password("hamlet")),
         )
-        self.assert_json_error(result, "Your username or password is incorrect.", 403)
+        self.assert_json_error(result, "Your username or password is incorrect", 401)
 
         # Override access with `org_membership`
         self.change_ldap_user_attr("hamlet", "department", "zulip")
         result = self.client_post(
             "/api/v1/fetch_api_key",
-            dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+            dict(username="hamlet", password=self.ldap_password("hamlet")),
         )
         self.assert_json_success(result)
         self.remove_ldap_user_attr("hamlet", "department")
@@ -3900,9 +4227,9 @@ class FetchAPIKeyTest(ZulipTestCase):
         ):
             result = self.client_post(
                 "/api/v1/fetch_api_key",
-                dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
+                dict(username="hamlet", password=self.ldap_password("hamlet")),
             )
-            self.assert_json_error(result, "Your username or password is incorrect.", 403)
+            self.assert_json_error(result, "Your username or password is incorrect", 401)
 
     def test_inactive_user(self) -> None:
         do_deactivate_user(self.user_profile, acting_user=None)
@@ -3910,7 +4237,7 @@ class FetchAPIKeyTest(ZulipTestCase):
             "/api/v1/fetch_api_key",
             dict(username=self.email, password=initial_password(self.email)),
         )
-        self.assert_json_error_contains(result, "Your account has been disabled", 403)
+        self.assert_json_error_contains(result, "Account is deactivated", 401)
 
     def test_deactivated_realm(self) -> None:
         do_deactivate_realm(self.user_profile.realm, acting_user=None)
@@ -3918,7 +4245,7 @@ class FetchAPIKeyTest(ZulipTestCase):
             "/api/v1/fetch_api_key",
             dict(username=self.email, password=initial_password(self.email)),
         )
-        self.assert_json_error_contains(result, "This organization has been deactivated", 403)
+        self.assert_json_error_contains(result, "This organization has been deactivated", 401)
 
     def test_old_weak_password_after_hasher_change(self) -> None:
         user_profile = self.example_user("hamlet")
@@ -3939,7 +4266,9 @@ class FetchAPIKeyTest(ZulipTestCase):
                 "/api/v1/fetch_api_key",
                 dict(username=self.email, password=password),
             )
-            self.assert_json_error(result, "You need to reset your password.", 403)
+            self.assert_json_error(
+                result, "Your password has been disabled and needs to be reset", 401
+            )
 
 
 class DevFetchAPIKeyTest(ZulipTestCase):
@@ -3964,17 +4293,17 @@ class DevFetchAPIKeyTest(ZulipTestCase):
     def test_unregistered_user(self) -> None:
         email = "foo@zulip.com"
         result = self.client_post("/api/v1/dev_fetch_api_key", dict(username=email))
-        self.assert_json_error_contains(result, "This user is not registered.", 403)
+        self.assert_json_error_contains(result, "Your username or password is incorrect", 401)
 
     def test_inactive_user(self) -> None:
         do_deactivate_user(self.user_profile, acting_user=None)
         result = self.client_post("/api/v1/dev_fetch_api_key", dict(username=self.email))
-        self.assert_json_error_contains(result, "Your account has been disabled", 403)
+        self.assert_json_error_contains(result, "Account is deactivated", 401)
 
     def test_deactivated_realm(self) -> None:
         do_deactivate_realm(self.user_profile.realm, acting_user=None)
         result = self.client_post("/api/v1/dev_fetch_api_key", dict(username=self.email))
-        self.assert_json_error_contains(result, "This organization has been deactivated", 403)
+        self.assert_json_error_contains(result, "This organization has been deactivated", 401)
 
     def test_dev_auth_disabled(self) -> None:
         with mock.patch("zerver.views.development.dev_login.dev_auth_enabled", return_value=False):
@@ -3989,7 +4318,7 @@ class DevFetchAPIKeyTest(ZulipTestCase):
                 "/api/v1/dev_fetch_api_key",
                 dict(username=self.email, password=initial_password(self.email)),
             )
-            self.assert_json_error_contains(result, "Invalid subdomain", 400)
+            self.assert_json_error_contains(result, "Invalid subdomain", 404)
 
 
 class DevGetEmailsTest(ZulipTestCase):
@@ -4699,7 +5028,7 @@ class TestJWTLogin(ZulipTestCase):
             realm = get_realm("zulip")
             key = settings.JWT_AUTH_KEYS["zulip"]["key"]
             [algorithm] = settings.JWT_AUTH_KEYS["zulip"]["algorithms"]
-            web_token = jwt.encode(payload, key, algorithm).decode("utf8")
+            web_token = jwt.encode(payload, key, algorithm)
 
             user_profile = get_user_by_delivery_email(email, realm)
             data = {"json_web_token": web_token}
@@ -4712,7 +5041,7 @@ class TestJWTLogin(ZulipTestCase):
         with self.settings(JWT_AUTH_KEYS={"zulip": {"key": "key", "algorithms": ["HS256"]}}):
             key = settings.JWT_AUTH_KEYS["zulip"]["key"]
             [algorithm] = settings.JWT_AUTH_KEYS["zulip"]["algorithms"]
-            web_token = jwt.encode(payload, key, algorithm).decode("utf8")
+            web_token = jwt.encode(payload, key, algorithm)
             data = {"json_web_token": web_token}
             result = self.client_post("/accounts/login/jwt/", data)
             self.assert_json_error_contains(
@@ -4724,7 +5053,7 @@ class TestJWTLogin(ZulipTestCase):
         with self.settings(JWT_AUTH_KEYS={"zulip": {"key": "key", "algorithms": ["HS256"]}}):
             key = settings.JWT_AUTH_KEYS["zulip"]["key"]
             [algorithm] = settings.JWT_AUTH_KEYS["zulip"]["algorithms"]
-            web_token = jwt.encode(payload, key, algorithm).decode("utf8")
+            web_token = jwt.encode(payload, key, algorithm)
             data = {"json_web_token": web_token}
             result = self.client_post("/accounts/login/jwt/", data)
             self.assert_json_error_contains(
@@ -4754,7 +5083,7 @@ class TestJWTLogin(ZulipTestCase):
         with self.settings(JWT_AUTH_KEYS={"zulip": {"key": "key", "algorithms": ["HS256"]}}):
             key = settings.JWT_AUTH_KEYS["zulip"]["key"]
             [algorithm] = settings.JWT_AUTH_KEYS["zulip"]["algorithms"]
-            web_token = jwt.encode(payload, key, algorithm).decode("utf8")
+            web_token = jwt.encode(payload, key, algorithm)
             data = {"json_web_token": web_token}
             result = self.client_post("/accounts/login/jwt/", data)
             self.assertEqual(result.status_code, 200)  # This should ideally be not 200.
@@ -4766,7 +5095,7 @@ class TestJWTLogin(ZulipTestCase):
             with mock.patch("zerver.views.auth.get_subdomain", return_value="acme"):
                 key = settings.JWT_AUTH_KEYS["acme"]["key"]
                 [algorithm] = settings.JWT_AUTH_KEYS["acme"]["algorithms"]
-                web_token = jwt.encode(payload, key, algorithm).decode("utf8")
+                web_token = jwt.encode(payload, key, algorithm)
 
                 data = {"json_web_token": web_token}
                 result = self.client_post("/accounts/login/jwt/", data)
@@ -4779,7 +5108,7 @@ class TestJWTLogin(ZulipTestCase):
             with mock.patch("zerver.views.auth.get_subdomain", return_value=""):
                 key = settings.JWT_AUTH_KEYS[""]["key"]
                 [algorithm] = settings.JWT_AUTH_KEYS[""]["algorithms"]
-                web_token = jwt.encode(payload, key, algorithm).decode("utf8")
+                web_token = jwt.encode(payload, key, algorithm)
 
                 data = {"json_web_token": web_token}
                 result = self.client_post("/accounts/login/jwt/", data)
@@ -4792,7 +5121,7 @@ class TestJWTLogin(ZulipTestCase):
             with mock.patch("zerver.views.auth.get_subdomain", return_value="zulip"):
                 key = settings.JWT_AUTH_KEYS["zulip"]["key"]
                 [algorithm] = settings.JWT_AUTH_KEYS["zulip"]["algorithms"]
-                web_token = jwt.encode(payload, key, algorithm).decode("utf8")
+                web_token = jwt.encode(payload, key, algorithm)
 
                 data = {"json_web_token": web_token}
                 result = self.client_post("/accounts/login/jwt/", data)

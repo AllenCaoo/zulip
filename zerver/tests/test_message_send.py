@@ -1,5 +1,5 @@
 import datetime
-from typing import Any, Optional, Set
+from typing import Any, List, Mapping, Optional, Set
 from unittest import mock
 
 import orjson
@@ -48,7 +48,6 @@ from zerver.lib.test_helpers import (
 )
 from zerver.lib.timestamp import convert_to_UTC, datetime_to_timestamp
 from zerver.models import (
-    MAX_MESSAGE_LENGTH,
     MAX_TOPIC_NAME_LENGTH,
     Message,
     Realm,
@@ -900,12 +899,29 @@ class MessagePOSTTest(ZulipTestCase):
         sent_message = self.get_last_message()
         self.assertEqual(sent_message.content, "  I like whitespace at the end!")
 
+        # Test if it removes the new line from the beginning of the message.
+        post_data = {
+            "type": "stream",
+            "to": "Verona",
+            "client": "test suite",
+            "content": "\nAvoid the new line at the beginning of the message.",
+            "topic": "Test topic",
+        }
+        result = self.client_post("/json/messages", post_data)
+        self.assert_json_success(result)
+        sent_message = self.get_last_message()
+        self.assertEqual(
+            sent_message.content, "Avoid the new line at the beginning of the message."
+        )
+
+    @override_settings(MAX_MESSAGE_LENGTH=25)
     def test_long_message(self) -> None:
         """
         Sending a message longer than the maximum message length succeeds but is
         truncated.
         """
         self.login("hamlet")
+        MAX_MESSAGE_LENGTH = settings.MAX_MESSAGE_LENGTH
         long_message = "A" * (MAX_MESSAGE_LENGTH + 1)
         post_data = {
             "type": "stream",
@@ -1660,14 +1676,14 @@ class StreamMessagesTest(ZulipTestCase):
         )
 
     def _send_stream_message(self, user: UserProfile, stream_name: str, content: str) -> Set[int]:
-        with mock.patch("zerver.lib.actions.send_event") as m:
+        events: List[Mapping[str, Any]] = []
+        with self.tornado_redirected_to_list(events, expected_num_events=1):
             self.send_stream_message(
                 user,
                 stream_name,
                 content=content,
             )
-        self.assertEqual(m.call_count, 1)
-        users = m.call_args[0][2]
+        users = events[0]["users"]
         user_ids = {u["id"] for u in users}
         return user_ids
 

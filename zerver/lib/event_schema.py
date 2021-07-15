@@ -230,8 +230,6 @@ delete_message_event = event_dict_type(
         ("message_ids", ListType(int)),
         ("stream_id", int),
         ("topic", str),
-        ("recipient_id", int),
-        ("sender_id", int),
     ],
 )
 _check_delete_message = make_checker(delete_message_event)
@@ -253,7 +251,7 @@ def check_delete_message(
     if message_type == "stream":
         keys |= {"stream_id", "topic"}
     elif message_type == "private":
-        keys |= {"recipient_id", "sender_id"}
+        pass
     else:
         raise AssertionError("unexpected message_type")
 
@@ -286,6 +284,23 @@ def check_has_zoom_token(
 ) -> None:
     _check_has_zoom_token(var_name, event)
     assert event["value"] == value
+
+
+heartbeat_event = event_dict_type(
+    required_keys=[
+        # force vertical
+        ("type", Equals("heartbeat")),
+    ]
+)
+_check_hearbeat = make_checker(heartbeat_event)
+
+
+def check_heartbeat(
+    # force vertical
+    var_name: str,
+    event: Dict[str, object],
+) -> None:
+    _check_hearbeat(var_name, event)
 
 
 _hotspot = DictType(
@@ -931,7 +946,7 @@ message_edit_data = DictType(
     required_keys=[
         ("allow_message_editing", bool),
         ("message_content_edit_limit_seconds", int),
-        ("allow_community_topic_editing", bool),
+        ("edit_topic_policy", int),
     ]
 )
 
@@ -1010,6 +1025,7 @@ realm_user_type = DictType(
         ("avatar_version", int),
         ("full_name", str),
         ("is_admin", bool),
+        ("is_billing_admin", bool),
         ("is_owner", bool),
         ("is_bot", bool),
         ("is_guest", bool),
@@ -1098,6 +1114,13 @@ realm_user_person_types = dict(
             # vertical formatting
             ("user_id", int),
             ("full_name", str),
+        ],
+    ),
+    is_billing_admin=DictType(
+        required_keys=[
+            # vertical formatting
+            ("user_id", int),
+            ("is_billing_admin", bool),
         ],
     ),
     role=DictType(
@@ -1389,8 +1412,11 @@ def check_update_display_settings(
     setting = event["setting"]
 
     assert isinstance(setting_name, str)
-    setting_type = UserProfile.property_types[setting_name]
-    assert isinstance(setting, setting_type)
+    if setting_name == "timezone":
+        assert isinstance(setting, str)
+    else:
+        setting_type = UserProfile.property_types[setting_name]
+        assert isinstance(setting, setting_type)
 
     if setting_name == "default_language":
         assert "language_name" in event.keys()

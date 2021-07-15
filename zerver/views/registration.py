@@ -36,7 +36,7 @@ from zerver.forms import (
 )
 from zerver.lib.actions import (
     bulk_add_subscriptions,
-    do_activate_user,
+    do_activate_mirror_dummy_user,
     do_change_full_name,
     do_change_password,
     do_create_realm,
@@ -85,6 +85,10 @@ from zproject.backends import (
     ldap_auth_enabled,
     password_auth_enabled,
 )
+
+if settings.BILLING_ENABLED:
+    from corporate.lib.registration import check_spare_licenses_available_for_registering_new_user
+    from corporate.lib.stripe import LicenseLimitError
 
 
 def check_prereg_key_and_redirect(request: HttpRequest, confirmation_key: str) -> HttpResponse:
@@ -180,6 +184,12 @@ def accounts_register(request: HttpRequest) -> HttpResponse:
             validate_email_not_already_in_realm(realm, email)
         except ValidationError:
             return redirect_to_email_login_url(email)
+
+        if settings.BILLING_ENABLED:
+            try:
+                check_spare_licenses_available_for_registering_new_user(realm, email)
+            except LicenseLimitError:
+                return render(request, "zerver/no_spare_licenses.html")
 
     name_validated = False
     full_name = None
@@ -396,11 +406,11 @@ def accounts_register(request: HttpRequest) -> HttpResponse:
 
         if existing_user_profile is not None and existing_user_profile.is_mirror_dummy:
             user_profile = existing_user_profile
-            do_activate_user(user_profile, acting_user=user_profile)
+            do_activate_mirror_dummy_user(user_profile, acting_user=user_profile)
             do_change_password(user_profile, password)
             do_change_full_name(user_profile, full_name, user_profile)
             do_set_user_display_setting(user_profile, "timezone", timezone)
-            # TODO: When we clean up the `do_activate_user` code path,
+            # TODO: When we clean up the `do_activate_mirror_dummy_user` code path,
             # make it respect invited_as_admin / is_realm_admin.
 
         if user_profile is None:
@@ -534,7 +544,10 @@ def send_confirm_registration_email(
         to_emails=[email],
         from_address=FromAddress.tokenized_no_reply_address(),
         language=language,
-        context={"activate_url": activation_url},
+        context={
+            "create_realm": (realm is None),
+            "activate_url": activation_url,
+        },
         realm=realm,
     )
 

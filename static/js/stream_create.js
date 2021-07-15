@@ -1,11 +1,12 @@
 import $ from "jquery";
 
 import render_announce_stream_docs from "../templates/announce_stream_docs.hbs";
+import render_subscription_invites_warning_modal from "../templates/confirm_dialog/confirm_subscription_invites_warning.hbs";
 import render_new_stream_user from "../templates/new_stream_user.hbs";
 import render_new_stream_users from "../templates/new_stream_users.hbs";
-import render_subscription_invites_warning_modal from "../templates/subscription_invites_warning_modal.hbs";
 
 import * as channel from "./channel";
+import * as confirm_dialog from "./confirm_dialog";
 import {$t, $t_html} from "./i18n";
 import * as ListWidget from "./list_widget";
 import * as loading from "./loading";
@@ -14,7 +15,7 @@ import * as peer_data from "./peer_data";
 import * as people from "./people";
 import * as stream_data from "./stream_data";
 import * as stream_settings_data from "./stream_settings_data";
-import * as subs from "./subs";
+import * as stream_settings_ui from "./stream_settings_ui";
 import * as ui_report from "./ui_report";
 
 let created_stream;
@@ -259,7 +260,7 @@ function create_stream() {
 export function new_stream_clicked(stream_name) {
     // this changes the tab switcher (settings/preview) which isn't necessary
     // to a add new stream title.
-    subs.show_subs_pane.create_stream();
+    stream_settings_ui.show_subs_pane.create_stream();
     $(".stream-row.active").removeClass("active");
 
     if (stream_name !== "") {
@@ -430,23 +431,23 @@ export function set_up_handlers() {
         }
 
         if (principals.length >= 50) {
-            const invites_warning_modal = render_subscription_invites_warning_modal({
+            const modal_parent = $("#subscription_overlay");
+            const html_body = render_subscription_invites_warning_modal({
                 stream_name,
                 count: principals.length,
             });
-            $("#stream-creation").append(invites_warning_modal);
+
+            confirm_dialog.launch({
+                parent: modal_parent,
+                html_heading: $t_html({defaultMessage: "Large number of subscribers"}),
+                html_body,
+                on_click: () => {
+                    create_stream();
+                },
+            });
         } else {
             create_stream();
         }
-    });
-
-    container.on("click", ".close-invites-warning-modal", () => {
-        $("#invites-warning-overlay").remove();
-    });
-
-    container.on("click", ".confirm-invites-warning-modal", () => {
-        create_stream();
-        $("#invites-warning-overlay").remove();
     });
 
     container.on("input", "#create_stream_name", () => {
@@ -483,7 +484,7 @@ export function set_up_handlers() {
     // Do not allow the user to enter newline characters while typing out the
     // stream's description during it's creation.
     container.on("keydown", "#create_stream_description", (e) => {
-        if ((e.keyCode || e.which) === 13) {
+        if (e.key === "Enter") {
             e.preventDefault();
         }
     });

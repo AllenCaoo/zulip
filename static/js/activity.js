@@ -183,7 +183,7 @@ export function send_presence_to_server(want_redraw) {
     // which will clear suspect_offline and potentially trigger a
     // reload if the device was offline for more than
     // DEFAULT_EVENT_QUEUE_TIMEOUT_SECS).
-    if (page_params.is_web_public_visitor) {
+    if (page_params.is_spectator) {
         return;
     }
 
@@ -326,15 +326,15 @@ export function set_cursor_and_filter() {
     keydown_util.handle({
         elem: $input,
         handlers: {
-            enter_key() {
+            Enter() {
                 keydown_enter_key();
                 return true;
             },
-            up_arrow() {
+            ArrowUp() {
                 user_cursor.prev();
                 return true;
             },
-            down_arrow() {
+            ArrowDown() {
                 user_cursor.next();
                 return true;
             },

@@ -11,7 +11,53 @@ below features are supported.
 
 ## Changes in Zulip 5.0
 
-**Feature level 70**
+**Feature level 77**
+
+* [`GET /events`](/api/get-events): Removed `recipient_id` and
+  `sender_id` field in responses of `delete_message` event when
+  `message_type` is `private`.
+
+**Feature level 76**
+
+* [`POST /fetch_api_key`](/api/fetch-api-key), [`POST
+  /dev_fetch_api_key`](/api/dev-fetch-api-key): The HTTP status for
+  authentication errors is now 401. This was previously 403.
+* All API endpoints now use the HTTP 401 error status for API requests
+  involving a deactivated user or realm. This was previously 403.
+* Mobile push notifications now include the `mentioned_user_group_id`
+  and `mentioned_user_group_name` fields when a user group containing
+  the user is mentioned.  Previously, these were indistinguishable
+  from personal mentions (as both types have `trigger="mention"`).
+
+**Feature level 75**
+
+* [`POST /register`](/api/register-queue), `PATCH /realm`: Replaced `allow_community_topic_editing`
+  field with an integer field `edit_topic_policy`.
+
+**Feature level 74**
+
+* [`POST /register`](/api/register-queue): Added `server_needs_upgrade`
+  and `event_queue_longpoll_timeout_seconds` field when fetching
+  realm data.
+
+**Feature level 73**
+
+* [`GET /users`](/api/get-users), [`GET /users/{user_id}`](/api/get-user),
+  [`GET /users/{email}`](/api/get-user-by-email) and
+  [`GET /users/me`](/api/get-own-user): Added `is_billing_admin` field to
+  returned user objects.
+* [`GET /events`](/api/get-events): Added `is_billing_admin` field to
+  user objects sent in `realm_user` events.
+* [`POST /register`](/api/register-queue): Added `is_billing_admin` field
+  in the user objects returned in the `realm_users` field.
+
+**Feature level 72**
+
+* [`POST /register`](/api/register-queue): Renamed `max_icon_file_size` to
+  `max_icon_file_size_mib`, `realm_upload_quota` to `realm_upload_quota_mib`
+  and `max_logo_file_size` to `max_logo_file_size_mib`.
+
+**Feature level 71**
 
 * [`GET /events`](/api/get-events): Added `is_web_public` field to
   `stream` events changing `invite_only`.
@@ -156,14 +202,14 @@ field with an integer field `invite_to_realm_policy`.
 
 **Feature level 49**
 
-* Added new [`POST /realm/playground`](/api/add-playground) and
-  [`DELETE /realm/playground/{playground_id}`](/api/remove-playground)
-  endpoints for realm playgrounds.
+* Added new [`POST /realm/playground`](/api/add-code-playground) and
+  [`DELETE /realm/playground/{playground_id}`](/api/remove-code-playground)
+  endpoints for code playgrounds.
 * [`GET /events`](/api/get-events): A new `realm_playgrounds` events
-  is sent when changes are made to a set of configured playgrounds for
+  is sent when changes are made to a set of configured code playgrounds for
   an organization.
 * [`POST /register`](/api/register-queue): Added a new `realm_playgrounds`
-  field, which is required to fetch the set of configured playgrounds for
+  field, which is required to fetch the set of configured code playgrounds for
   an organization.
 
 **Feature level 48**
@@ -240,6 +286,8 @@ field with an integer field `invite_to_realm_policy`.
 
 * [`POST /users`](/api/create-user): Restricted access to organization
   administrators with the `can_create_users` permission.
+* [Error handling](/api/rest-error-handling): The `code` property will
+  not be present in errors due to rate limits.
 
 **Feature level 35**
 

@@ -10,6 +10,7 @@ import * as compose_actions from "./compose_actions";
 import * as compose_state from "./compose_state";
 import * as condense from "./condense";
 import * as copy_and_paste from "./copy_and_paste";
+import * as deprecated_feature_notice from "./deprecated_feature_notice";
 import * as drafts from "./drafts";
 import * as emoji_picker from "./emoji_picker";
 import * as feedback_widget from "./feedback_widget";
@@ -23,19 +24,20 @@ import * as message_edit from "./message_edit";
 import * as message_flags from "./message_flags";
 import * as message_lists from "./message_lists";
 import * as message_view_header from "./message_view_header";
-import * as muting_ui from "./muting_ui";
+import * as muted_topics_ui from "./muted_topics_ui";
 import * as narrow from "./narrow";
 import * as navigate from "./navigate";
 import * as overlays from "./overlays";
 import {page_params} from "./page_params";
 import * as popovers from "./popovers";
 import * as reactions from "./reactions";
-import * as recent_topics from "./recent_topics";
+import * as recent_topics_ui from "./recent_topics_ui";
+import * as recent_topics_util from "./recent_topics_util";
 import * as search from "./search";
 import * as settings_data from "./settings_data";
 import * as stream_list from "./stream_list";
 import * as stream_popover from "./stream_popover";
-import * as subs from "./subs";
+import * as stream_settings_ui from "./stream_settings_ui";
 import * as topic_zoom from "./topic_zoom";
 import * as ui from "./ui";
 
@@ -209,7 +211,6 @@ export function processing_text() {
         $focused_elt.is("input") ||
         $focused_elt.is("select") ||
         $focused_elt.is("textarea") ||
-        $focused_elt.hasClass("editable-section") ||
         $focused_elt.parents(".pill-container").length >= 1 ||
         $focused_elt.attr("id") === "compose-send-button"
     );
@@ -222,18 +223,14 @@ export function in_content_editable_widget(e) {
 // Returns true if we handled it, false if the browser should.
 export function process_escape_key(e) {
     if (
-        recent_topics.is_in_focus() &&
+        recent_topics_util.is_in_focus() &&
         // This will return false if `e.target` is not
         // any of the recent topics elements by design.
-        recent_topics.change_focused_element($(e.target), "escape")
+        recent_topics_ui.change_focused_element($(e.target), "escape")
     ) {
         // Recent topics uses escape to switch focus from RT search / filters to topics table.
         // If focus is already on the table it returns false.
         return true;
-    }
-
-    if (in_content_editable_widget(e)) {
-        return false;
     }
 
     if (feedback_widget.is_open()) {
@@ -398,11 +395,6 @@ export function process_enter_key(e) {
         return emoji_picker.navigate("enter", e);
     }
 
-    if (in_content_editable_widget(e)) {
-        $(e.target).parent().find(".checkmark").trigger("click");
-        return false;
-    }
-
     if (handle_popover_events("enter")) {
         return true;
     }
@@ -549,8 +541,8 @@ export function process_hotkey(e, hotkey) {
         case "tab":
         case "shift_tab":
         case "open_recent_topics":
-            if (recent_topics.is_in_focus()) {
-                return recent_topics.change_focused_element($(e.target), event_name);
+            if (recent_topics_util.is_in_focus()) {
+                return recent_topics_ui.change_focused_element($(e.target), event_name);
             }
     }
 
@@ -564,6 +556,10 @@ export function process_hotkey(e, hotkey) {
             return process_tab_key();
         case "shift_tab":
             return process_shift_tab_key();
+    }
+
+    if (overlays.is_modal_open()) {
+        return false;
     }
 
     // TODO: break out specific handlers for up_arrow,
@@ -586,7 +582,7 @@ export function process_hotkey(e, hotkey) {
             return false;
         }
         if (event_name === "narrow_by_topic" && overlays.streams_open()) {
-            subs.keyboard_sub();
+            stream_settings_ui.keyboard_sub();
             return true;
         }
         if (event_name === "show_lightbox" && overlays.lightbox_open()) {
@@ -625,13 +621,7 @@ export function process_hotkey(e, hotkey) {
     }
 
     if ((event_name === "up_arrow" || event_name === "down_arrow") && overlays.streams_open()) {
-        return subs.switch_rows(event_name);
-    }
-
-    if (in_content_editable_widget(e)) {
-        // We handle the Enter key in process_enter_key().
-        // We ignore all other keys.
-        return false;
+        return stream_settings_ui.switch_rows(event_name);
     }
 
     if (event_name === "up_arrow" && list_util.inside_list(e)) {
@@ -713,7 +703,7 @@ export function process_hotkey(e, hotkey) {
             lightbox.prev();
             return true;
         } else if (overlays.streams_open()) {
-            subs.toggle_view(event_name);
+            stream_settings_ui.toggle_view(event_name);
             return true;
         }
 
@@ -726,7 +716,7 @@ export function process_hotkey(e, hotkey) {
             lightbox.next();
             return true;
         } else if (overlays.streams_open()) {
-            subs.toggle_view(event_name);
+            stream_settings_ui.toggle_view(event_name);
             return true;
         }
     }
@@ -734,7 +724,7 @@ export function process_hotkey(e, hotkey) {
     // Prevent navigation in the background when the overlays are active.
     if (overlays.is_active()) {
         if (event_name === "view_selected_stream" && overlays.streams_open()) {
-            subs.view_stream();
+            stream_settings_ui.view_stream();
             return true;
         }
         if (
@@ -742,7 +732,7 @@ export function process_hotkey(e, hotkey) {
             overlays.streams_open() &&
             settings_data.user_can_create_streams()
         ) {
-            subs.open_create_stream();
+            stream_settings_ui.open_create_stream();
             return true;
         }
         return false;
@@ -807,16 +797,16 @@ export function process_hotkey(e, hotkey) {
             browser_history.go_to_location("drafts");
             return true;
         case "C_deprecated":
-            ui.maybe_show_deprecation_notice("C");
+            deprecated_feature_notice.maybe_show_deprecation_notice("C");
             return true;
         case "star_deprecated":
-            ui.maybe_show_deprecation_notice("*");
+            deprecated_feature_notice.maybe_show_deprecation_notice("*");
             return true;
     }
 
     // We don't want hotkeys below this to work when recent topics is
     // open. These involve hotkeys that can only be performed on a message.
-    if (recent_topics.is_visible()) {
+    if (recent_topics_util.is_visible()) {
         return false;
     }
 
@@ -893,7 +883,7 @@ export function process_hotkey(e, hotkey) {
             return true;
         }
         case "toggle_topic_mute":
-            muting_ui.toggle_topic_mute(msg);
+            muted_topics_ui.toggle_topic_mute(msg);
             return true;
         case "toggle_message_collapse":
             condense.toggle_collapse(msg);

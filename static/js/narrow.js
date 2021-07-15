@@ -23,14 +23,14 @@ import * as narrow_state from "./narrow_state";
 import * as notifications from "./notifications";
 import {page_params} from "./page_params";
 import * as people from "./people";
-import * as recent_topics from "./recent_topics";
+import * as recent_topics_ui from "./recent_topics_ui";
+import * as recent_topics_util from "./recent_topics_util";
 import * as resize from "./resize";
 import * as search from "./search";
 import * as search_pill from "./search_pill";
 import * as search_pill_widget from "./search_pill_widget";
 import * as stream_data from "./stream_data";
 import * as stream_list from "./stream_list";
-import * as stream_topic_history from "./stream_topic_history";
 import * as top_left_corner from "./top_left_corner";
 import * as topic_generator from "./topic_generator";
 import * as typing_events from "./typing_events";
@@ -187,8 +187,8 @@ export function activate(raw_operators, opts) {
          or rerendering due to server-side changes.
     */
 
-    if (recent_topics.is_visible()) {
-        recent_topics.hide();
+    if (recent_topics_util.is_visible()) {
+        recent_topics_ui.hide();
     }
 
     const start_time = new Date();
@@ -771,10 +771,9 @@ export function to_compose_target() {
         }
         // If we are composing to a new topic, we narrow to the stream but
         // grey-out the message view instead of narrowing to an empty view.
-        const topics = stream_topic_history.get_recent_topic_names(stream_id);
         const operators = [{operator: "stream", operand: stream_name}];
         const topic = compose_state.topic();
-        if (topics.includes(topic)) {
+        if (topic !== "") {
             operators.push({operator: "topic", operand: topic});
         }
         activate(operators, opts);

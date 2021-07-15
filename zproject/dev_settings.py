@@ -57,6 +57,7 @@ AUTHENTICATION_BACKENDS: Tuple[str, ...] = (
     # 'zproject.backends.AzureADAuthBackend',
     "zproject.backends.GitLabAuthBackend",
     "zproject.backends.AppleAuthBackend",
+    "zproject.backends.GenericOpenIdConnectBackend",
 )
 
 EXTERNAL_URI_SCHEME = "http://"
@@ -76,9 +77,6 @@ OPEN_REALM_CREATION = True
 INVITES_MIN_USER_AGE_DAYS = 0
 
 EMBEDDED_BOTS_ENABLED = True
-
-SAVE_FRONTEND_STACKTRACES = True
-STAGING_ERROR_NOTIFICATIONS = True
 
 SYSTEM_ONLY_REALMS: Set[str] = set()
 USING_PGROONGA = True
